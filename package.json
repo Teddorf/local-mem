@@ -1,0 +1,16 @@
+{
+  "name": "local-mem",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Persistent local memory for Claude Code — SQLite + MCP, zero dependencies",
+  "scripts": {
+    "install-mem": "bun install.mjs",
+    "uninstall": "bun uninstall.mjs",
+    "status": "bun scripts/status.mjs",
+    "test": "bun test"
+  },
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}
