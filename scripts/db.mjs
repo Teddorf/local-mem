@@ -185,8 +185,25 @@ export function normalizeCwd(cwd) {
   return normalized;
 }
 
+// Singleton connection cache per process
+let _cachedDb = null;
+let _cachedDbPath = null;
+
 export function getDb(dbPath) {
   const resolvedPath = dbPath || process.env.LOCAL_MEM_DB_PATH || DEFAULT_DB_PATH;
+
+  // Return cached connection if same path and still open
+  if (_cachedDb && _cachedDbPath === resolvedPath) {
+    try {
+      // Quick check if connection is still valid
+      _cachedDb.prepare('SELECT 1').get();
+      return _cachedDb;
+    } catch {
+      _cachedDb = null;
+      _cachedDbPath = null;
+    }
+  }
+
   const dir = dirname(resolvedPath);
   try {
     mkdirSync(dir, { recursive: true });
@@ -197,13 +214,121 @@ export function getDb(dbPath) {
   db.exec('PRAGMA busy_timeout=5000');
   db.exec('PRAGMA wal_autocheckpoint=1000');
   db.exec(SCHEMA_SQL);
+
+  // Wrap close() to be a no-op for singleton — actual close via closeDb()
+  const originalClose = db.close.bind(db);
+  db.close = () => {}; // no-op: singleton stays open until process exit
+  db._realClose = originalClose;
+
+  _cachedDb = db;
+  _cachedDbPath = resolvedPath;
   // Migration logic: read schema_version and apply migrations if needed
   const row = db.prepare('SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1').get();
   const currentVersion = row ? row.version : 1;
-  // Future migrations go here:
-  // if (currentVersion < 2) { db.exec(MIGRATION_V2); db.prepare('UPDATE schema_version SET version=2 WHERE rowid=1').run(); }
-  void currentVersion;
+
+  if (currentVersion < 2) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // 1. Nuevas columnas en execution_snapshots
+      db.exec(`ALTER TABLE execution_snapshots ADD COLUMN snapshot_type TEXT DEFAULT 'manual'`);
+      db.exec(`ALTER TABLE execution_snapshots ADD COLUMN task_status TEXT DEFAULT 'in_progress'`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_snapshots_type
+        ON execution_snapshots(session_id, cwd, snapshot_type, created_at DESC)`);
+
+      // 2. Fix snapshots existentes (no dejar in_progress para sesiones cerradas)
+      db.exec(`UPDATE execution_snapshots SET task_status='completed'
+        WHERE session_id IN (SELECT session_id FROM sessions WHERE status='completed')`);
+      db.exec(`UPDATE execution_snapshots SET task_status='abandoned'
+        WHERE session_id IN (SELECT session_id FROM sessions WHERE status='abandoned')`);
+
+      // 3. Nueva tabla turn_log
+      db.exec(`CREATE TABLE IF NOT EXISTS turn_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        turn_number INTEGER NOT NULL,
+        thinking_text TEXT,
+        response_text TEXT,
+        created_at INTEGER NOT NULL,
+        UNIQUE(session_id, turn_number),
+        FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+      )`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_turn_session ON turn_log(session_id, turn_number)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_turn_cwd ON turn_log(cwd, created_at DESC)`);
+
+      db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS turn_fts USING fts5(
+        thinking_text, response_text,
+        content=turn_log, content_rowid=id
+      )`);
+
+      // FTS triggers for turn_log
+      db.exec(`CREATE TRIGGER IF NOT EXISTS turn_fts_insert AFTER INSERT ON turn_log BEGIN
+        INSERT INTO turn_fts(rowid, thinking_text, response_text)
+        VALUES (new.id, new.thinking_text, new.response_text);
+      END`);
+      db.exec(`CREATE TRIGGER IF NOT EXISTS turn_fts_delete AFTER DELETE ON turn_log BEGIN
+        INSERT INTO turn_fts(turn_fts, rowid, thinking_text, response_text)
+        VALUES ('delete', old.id, old.thinking_text, old.response_text);
+      END`);
+      db.exec(`CREATE TRIGGER IF NOT EXISTS turn_fts_update AFTER UPDATE ON turn_log BEGIN
+        INSERT INTO turn_fts(turn_fts, rowid, thinking_text, response_text)
+        VALUES ('delete', old.id, old.thinking_text, old.response_text);
+        INSERT INTO turn_fts(rowid, thinking_text, response_text)
+        VALUES (new.id, new.thinking_text, new.response_text);
+      END`);
+
+      // 4. Nueva tabla observation_scores
+      db.exec(`CREATE TABLE IF NOT EXISTS observation_scores (
+        observation_id INTEGER PRIMARY KEY,
+        composite_score REAL DEFAULT 0.5,
+        computed_at INTEGER NOT NULL,
+        FOREIGN KEY(observation_id) REFERENCES observations(id) ON DELETE CASCADE
+      )`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_scores_composite ON observation_scores(composite_score DESC)`);
+
+      // 5. Actualizar version
+      db.exec(`UPDATE schema_version SET version=2, applied_at=unixepoch() WHERE rowid=1`);
+
+      db.exec('COMMIT');
+      process.stderr.write('[local-mem] Migration v1→v2 applied\n');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw new Error(`Migration v1→v2 failed: ${e.message}`);
+    }
+  }
+
+  if (currentVersion < 3) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // 1. Deduplicate session_summaries: keep only most recent per session_id
+      db.exec(`DELETE FROM session_summaries WHERE id NOT IN (
+        SELECT MAX(id) FROM session_summaries GROUP BY session_id
+      )`);
+
+      // 2. Add unique index to prevent future duplicates
+      db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_summaries_session_unique
+        ON session_summaries(session_id)`);
+
+      db.exec(`UPDATE schema_version SET version=3, applied_at=unixepoch() WHERE rowid=1`);
+
+      db.exec('COMMIT');
+      process.stderr.write('[local-mem] Migration v2→v3 applied\n');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw new Error(`Migration v2→v3 failed: ${e.message}`);
+    }
+  }
+
   return db;
+}
+
+// Explicitly close the singleton connection (for process exit or install.mjs)
+export function closeDb() {
+  if (_cachedDb) {
+    try { _cachedDb._realClose(); } catch {}
+    _cachedDb = null;
+    _cachedDbPath = null;
+  }
 }
 
 export function ensureSession(sessionId, project, cwd) {
@@ -300,8 +425,9 @@ export function saveExecutionSnapshot(sessionId, data) {
     const result = db.prepare(`
       INSERT INTO execution_snapshots
         (session_id, cwd, current_task, execution_point, next_action,
-         pending_tasks, plan, open_decisions, active_files, blocking_issues, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+         pending_tasks, plan, open_decisions, active_files, blocking_issues,
+         snapshot_type, task_status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
     `).run(
       sessionId,
       nCwd,
@@ -312,12 +438,117 @@ export function saveExecutionSnapshot(sessionId, data) {
       jsonStringify(data.plan),
       jsonStringify(data.open_decisions),
       jsonStringify(data.active_files),
-      jsonStringify(data.blocking_issues)
+      jsonStringify(data.blocking_issues),
+      data.snapshot_type || 'manual',
+      data.task_status || 'in_progress'
     );
     return { id: Number(result.lastInsertRowid) };
   } finally {
     db.close();
   }
+}
+
+export function insertTurnLog(sessionId, cwd, turnData) {
+  const db = getDb();
+  const nCwd = normalizeCwd(cwd);
+  try {
+    const thinkingText = turnData.thinking_text
+      ? turnData.thinking_text.slice(0, 2048) : null;  // max 2KB
+    const responseText = turnData.response_text
+      ? turnData.response_text.slice(0, 1024) : null;  // max 1KB
+    db.prepare(`
+      INSERT INTO turn_log (session_id, cwd, turn_number, thinking_text, response_text, created_at)
+      VALUES (?, ?, ?, ?, ?, unixepoch())
+      ON CONFLICT(session_id, turn_number) DO UPDATE SET
+        thinking_text = excluded.thinking_text,
+        response_text = excluded.response_text
+    `).run(sessionId, nCwd, turnData.turn_number, thinkingText, responseText);
+  } finally {
+    db.close();
+  }
+}
+
+export function insertObservationScore(observationId, compositeScore) {
+  const db = getDb();
+  try {
+    db.prepare(`
+      INSERT OR REPLACE INTO observation_scores (observation_id, composite_score, computed_at)
+      VALUES (?, ?, unixepoch())
+    `).run(observationId, compositeScore);
+  } finally {
+    db.close();
+  }
+}
+
+export function searchThinking(query, cwd, opts = {}) {
+  const db = getDb();
+  const nCwd = normalizeCwd(cwd);
+  const limit = opts.limit || 10;
+  try {
+    const sanitized = sanitizeFtsQuery(query);
+    if (!sanitized) return [];
+    return db.prepare(`
+      SELECT t.id, t.session_id, t.turn_number, t.thinking_text, t.response_text,
+             t.created_at, f.rank
+      FROM turn_fts f
+      JOIN turn_log t ON t.id = f.rowid
+      WHERE turn_fts MATCH ? AND t.cwd = ?
+      ORDER BY f.rank
+      LIMIT ?
+    `).all(sanitized, nCwd, limit);
+  } finally {
+    db.close();
+  }
+}
+
+// Recency band applied at query-time: base_score + 0.3 * CASE(age)
+const RECENCY_SQL = `(s.composite_score + 0.3 * CASE
+  WHEN (unixepoch() - o.created_at) < 3600 THEN 1.0
+  WHEN (unixepoch() - o.created_at) < 21600 THEN 0.5
+  ELSE 0.25 END)`;
+
+export function getTopScoredObservations(cwd, opts = {}) {
+  const db = getDb();
+  const nCwd = normalizeCwd(cwd);
+  const minScore = opts.minScore ?? 0.4;
+  const limit = opts.limit || 15;
+  try {
+    return db.prepare(`
+      SELECT o.id, o.tool_name, o.action, o.detail,
+             ${RECENCY_SQL} AS composite_score, o.created_at
+      FROM observation_scores s
+      JOIN observations o ON o.id = s.observation_id
+      WHERE o.cwd = ? AND ${RECENCY_SQL} >= ?
+      ORDER BY ${RECENCY_SQL} DESC
+      LIMIT ?
+    `).all(nCwd, minScore, limit);
+  } finally {
+    db.close();
+  }
+}
+
+// Lightweight prompt fetcher (avoids full getRecentContext for auto-snapshots)
+export function getRecentPrompts(cwd, limit = 3) {
+  const db = getDb();
+  const nCwd = normalizeCwd(cwd);
+  try {
+    return db.prepare(`
+      SELECT p.prompt_text, p.created_at
+      FROM user_prompts p
+      JOIN sessions s ON s.session_id = p.session_id
+      WHERE s.cwd = ?
+      ORDER BY p.created_at DESC LIMIT ?
+    `).all(nCwd, limit);
+  } finally {
+    db.close();
+  }
+}
+
+// Dynamic threshold: max(0.25, topScore * 0.5)
+function getThreshold(scores) {
+  if (!scores || scores.length === 0) return 0.25;
+  const topScore = Math.max(...scores);
+  return Math.max(0.25, topScore * 0.5);
 }
 
 export function getRecentContext(cwd, opts = {}) {
@@ -326,9 +557,9 @@ export function getRecentContext(cwd, opts = {}) {
   const limit = opts.limit || 30;
   try {
     const observations = db.prepare(`
-      SELECT id, tool_name, action, files, cwd, created_at
-      FROM observations WHERE cwd = ?
-      ORDER BY created_at DESC LIMIT ?
+      SELECT o.id, o.tool_name, o.action, o.files, o.detail, o.cwd, o.created_at
+      FROM observations o WHERE o.cwd = ?
+      ORDER BY o.created_at DESC LIMIT ?
     `).all(nCwd, limit);
 
     const summary = db.prepare(`
@@ -338,14 +569,81 @@ export function getRecentContext(cwd, opts = {}) {
       ORDER BY created_at DESC LIMIT 1
     `).get(nCwd) || null;
 
+    // Preferir snapshot manual, fallback auto
     const snapshot = db.prepare(`
       SELECT id, session_id, cwd, current_task, execution_point, next_action,
-             pending_tasks, plan, open_decisions, active_files, blocking_issues, created_at
+             pending_tasks, plan, open_decisions, active_files, blocking_issues,
+             snapshot_type, task_status, created_at
       FROM execution_snapshots WHERE cwd = ?
+      ORDER BY CASE WHEN snapshot_type = 'manual' THEN 0 ELSE 1 END, created_at DESC
+      LIMIT 1
+    `).get(nCwd) || null;
+
+    // v0.6: ultimo thinking block
+    const thinking = db.prepare(`
+      SELECT thinking_text, response_text, created_at
+      FROM turn_log WHERE cwd = ?
       ORDER BY created_at DESC LIMIT 1
     `).get(nCwd) || null;
 
-    return { observations, summary, snapshot };
+    // v0.6: top observaciones por score con threshold dinamico (recency at query-time)
+    const allScored = db.prepare(`
+      SELECT o.id, o.tool_name, o.action, o.created_at,
+             ${RECENCY_SQL} AS composite_score
+      FROM observation_scores s
+      JOIN observations o ON o.id = s.observation_id
+      WHERE o.cwd = ?
+      ORDER BY ${RECENCY_SQL} DESC
+      LIMIT 30
+    `).all(nCwd);
+    const threshold = getThreshold(allScored.map(r => r.composite_score));
+    let topScored = allScored.filter(r => r.composite_score >= threshold);
+    // Fallback: if < 5 pass threshold, use top 5 anyway
+    if (topScored.length < 5 && allScored.length >= 5) {
+      topScored = allScored.slice(0, 5);
+    }
+    topScored = topScored.slice(0, 10);
+
+    // v0.6: ultimos 3 prompts
+    const prompts = db.prepare(`
+      SELECT p.prompt_text, p.created_at
+      FROM user_prompts p
+      JOIN sessions s ON s.session_id = p.session_id
+      WHERE s.cwd = ?
+      ORDER BY p.created_at DESC LIMIT 3
+    `).all(nCwd);
+
+    // v0.6: ultimas 3 sesiones con metadata + archivos clave
+    const recentSessions = db.prepare(`
+      SELECT s.session_id, s.project, s.started_at, s.completed_at, s.status,
+             s.observation_count, s.prompt_count,
+             ss.files_modified, ss.files_read
+      FROM sessions s
+      LEFT JOIN session_summaries ss ON ss.session_id = s.session_id
+      WHERE s.cwd = ?
+      ORDER BY s.started_at DESC LIMIT 3
+    `).all(nCwd);
+
+    return { observations, summary, snapshot, thinking, topScored, prompts, recentSessions };
+  } finally {
+    db.close();
+  }
+}
+
+export function pruneAutoSnapshots(sessionId, cwd, maxKeep = 3) {
+  const db = getDb();
+  const nCwd = normalizeCwd(cwd);
+  try {
+    // Keep only the N most recent auto-snapshots for this session
+    db.prepare(`
+      DELETE FROM execution_snapshots
+      WHERE id NOT IN (
+        SELECT id FROM execution_snapshots
+        WHERE session_id = ? AND cwd = ? AND snapshot_type = 'auto'
+        ORDER BY created_at DESC LIMIT ?
+      )
+      AND session_id = ? AND cwd = ? AND snapshot_type = 'auto'
+    `).run(sessionId, nCwd, maxKeep, sessionId, nCwd);
   } finally {
     db.close();
   }
@@ -401,13 +699,23 @@ export function getSessionStats(sessionId) {
   }
 }
 
-export function getLatestSnapshot(cwd) {
+export function getLatestSnapshot(cwd, snapshotType) {
   const db = getDb();
   const nCwd = normalizeCwd(cwd);
   try {
+    if (snapshotType) {
+      return db.prepare(`
+        SELECT id, session_id, cwd, current_task, execution_point, next_action,
+               pending_tasks, plan, open_decisions, active_files, blocking_issues,
+               snapshot_type, task_status, created_at
+        FROM execution_snapshots WHERE cwd = ? AND snapshot_type = ?
+        ORDER BY created_at DESC LIMIT 1
+      `).get(nCwd, snapshotType) || null;
+    }
     return db.prepare(`
       SELECT id, session_id, cwd, current_task, execution_point, next_action,
-             pending_tasks, plan, open_decisions, active_files, blocking_issues, created_at
+             pending_tasks, plan, open_decisions, active_files, blocking_issues,
+             snapshot_type, task_status, created_at
       FROM execution_snapshots WHERE cwd = ?
       ORDER BY created_at DESC LIMIT 1
     `).get(nCwd) || null;
@@ -568,12 +876,21 @@ export function getCleanupTargets(cwd, olderThanDays) {
         AND session_id NOT IN (SELECT session_id FROM sessions WHERE status = 'active')
     `).get(nCwd, cutoff);
 
+    // v0.6: turn_log (30 dias default)
+    const turnLogCutoff = 30 * 86400;
+    const turnLogs = db.prepare(`
+      SELECT COUNT(*) as count FROM turn_log
+      WHERE cwd = ? AND created_at < unixepoch() - ?
+        AND session_id NOT IN (SELECT session_id FROM sessions WHERE status = 'active')
+    `).get(nCwd, turnLogCutoff);
+
     return {
       observations: obs.count,
       prompts: prompts.count,
       snapshots: snapshots.count,
       summaries: summaries.count,
-      total: obs.count + prompts.count + snapshots.count + summaries.count
+      turnLogs: turnLogs.count,
+      total: obs.count + prompts.count + snapshots.count + summaries.count + turnLogs.count
     };
   } finally {
     db.close();
@@ -585,7 +902,7 @@ export function executeCleanup(cwd, olderThanDays) {
   const nCwd = normalizeCwd(cwd);
   const cutoff = olderThanDays * 86400;
   let totalDeleted = 0;
-  let obsDeleted = 0, promptsDeleted = 0, snapshotsDeleted = 0, summariesDeleted = 0;
+  let obsDeleted = 0, promptsDeleted = 0, snapshotsDeleted = 0, summariesDeleted = 0, turnLogsDeleted = 0;
   try {
     db.exec('BEGIN');
     try {
@@ -617,13 +934,24 @@ export function executeCleanup(cwd, olderThanDays) {
       `).run(nCwd, cutoff);
       summariesDeleted = r4.changes;
 
+      // v0.6: cleanup turn_log (30 dias retention)
+      const turnLogCutoff = 30 * 86400;
+      const r5 = db.prepare(`
+        DELETE FROM turn_log
+        WHERE cwd = ? AND created_at < unixepoch() - ?
+          AND session_id NOT IN (SELECT session_id FROM sessions WHERE status = 'active')
+      `).run(nCwd, turnLogCutoff);
+      turnLogsDeleted = r5.changes;
+
+      // v0.6: observation_scores cleaned via CASCADE on observations delete
+
       db.exec('COMMIT');
     } catch (e) {
       db.exec('ROLLBACK');
       throw e;
     }
 
-    totalDeleted = obsDeleted + promptsDeleted + snapshotsDeleted + summariesDeleted;
+    totalDeleted = obsDeleted + promptsDeleted + snapshotsDeleted + summariesDeleted + turnLogsDeleted;
     if (totalDeleted > 100) {
       db.exec('VACUUM');
     }
@@ -633,6 +961,7 @@ export function executeCleanup(cwd, olderThanDays) {
       prompts: promptsDeleted,
       snapshots: snapshotsDeleted,
       summaries: summariesDeleted,
+      turnLogs: turnLogsDeleted,
       total: totalDeleted,
       vacuumed: totalDeleted > 100
     };

@@ -1,16 +1,17 @@
 import { readFileSync } from 'fs';
 import { basename, isAbsolute } from 'path';
 import { readStdin } from './stdin.mjs';
-import { getDb, completeSession, getSessionStats, normalizeCwd } from './db.mjs';
+import { getDb, completeSession, getSessionStats, normalizeCwd, insertTurnLog } from './db.mjs';
+import { redact } from './redact.mjs';
 
-const LAST_50KB = 50 * 1024;
+const LAST_200KB = 200 * 1024;
 
 function extractTranscriptSummary(transcriptPath) {
   try {
     let buf;
     try { buf = readFileSync(transcriptPath); } catch { return null; }
-    const slice = buf.length > LAST_50KB
-      ? buf.slice(buf.length - LAST_50KB).toString('utf8')
+    const slice = buf.length > LAST_200KB
+      ? buf.slice(buf.length - LAST_200KB).toString('utf8')
       : buf.toString('utf8');
 
     const lines = slice.split('\n').filter(l => l.trim());
@@ -49,9 +50,51 @@ function extractTranscriptSummary(transcriptPath) {
       .replace(/<parameter name="context">[\s\S]*?<\/parameter>/gi, '')
       .trim();
 
-    return text || null;
+    return text ? redact(text) : null;
   } catch {
     return null;
+  }
+}
+
+async function extractThinkingFromTranscript(transcriptPath, sessionId, cwd) {
+  let buf;
+  try { buf = readFileSync(transcriptPath); } catch { return; }
+  const slice = buf.length > LAST_200KB
+    ? buf.slice(buf.length - LAST_200KB).toString('utf8')
+    : buf.toString('utf8');
+
+  const lines = slice.split('\n').filter(l => l.trim());
+  let turnNumber = 0;
+
+  for (const line of lines) {
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry.type !== 'assistant') continue;
+
+    const contentArray = entry.message?.content ?? entry.content;
+    if (!Array.isArray(contentArray)) continue;
+
+    let thinking_text = '';
+    let response_text = '';
+
+    for (const block of contentArray) {
+      if (block.type === 'thinking' && block.text) {
+        thinking_text += (thinking_text ? '\n' : '') + block.text;
+      } else if (block.type === 'text' && block.text) {
+        response_text += (response_text ? '\n' : '') + block.text;
+      }
+    }
+
+    if (!thinking_text && !response_text) continue;
+
+    turnNumber++;
+    try {
+      insertTurnLog(sessionId, cwd, {
+        turn_number: turnNumber,
+        thinking_text: thinking_text ? redact(thinking_text) : '',
+        response_text: response_text ? redact(response_text) : ''
+      });
+    } catch { /* best-effort */ }
   }
 }
 
@@ -117,6 +160,12 @@ try {
 
   if (useTranscript) {
     summaryText = extractTranscriptSummary(transcript_path);
+  }
+
+  if (useTranscript) {
+    try {
+      await extractThinkingFromTranscript(transcript_path, session_id, cwd);
+    } catch { /* best-effort — session still completes normally */ }
   }
 
   const stats = getSessionStats(session_id);

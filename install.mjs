@@ -58,30 +58,31 @@ function setupDataDir() {
 
 // Initialize DB
 async function initDb() {
-  const { getDb } = await import('./scripts/db.mjs');
-  const db = getDb();
-  db.close();
+  const { getDb, closeDb } = await import('./scripts/db.mjs');
+  getDb();
+  closeDb();
   console.log('[OK] Base de datos inicializada.');
 }
 
-// Build hook config with quoted paths
+// Build hook config with properly quoted and normalized paths
 function buildHookConfig() {
   const b = `"${BUN_PATH}"`;
-  const p = `"${PROJECT_PATH}`;
+  // Use join() for consistent path separators per platform
+  const scriptPath = (name) => `"${join(PROJECT_PATH, 'scripts', name)}"`;
 
   return {
     SessionStart: {
       matcher: 'startup|resume|clear|compact',
       hooks: [{
         type: 'command',
-        command: `${b} ${p}/scripts/session-start.mjs"`,
+        command: `${b} ${scriptPath('session-start.mjs')}`,
         timeout: 10
       }]
     },
     UserPromptSubmit: {
       hooks: [{
         type: 'command',
-        command: `${b} ${p}/scripts/prompt-submit.mjs"`,
+        command: `${b} ${scriptPath('prompt-submit.mjs')}`,
         timeout: 10
       }]
     },
@@ -89,15 +90,15 @@ function buildHookConfig() {
       matcher: '*',
       hooks: [{
         type: 'command',
-        command: `${b} ${p}/scripts/observation.mjs"`,
+        command: `${b} ${scriptPath('observation.mjs')}`,
         timeout: 10
       }]
     },
     SessionEnd: {
       hooks: [{
         type: 'command',
-        command: `${b} ${p}/scripts/session-end.mjs"`,
-        timeout: 15
+        command: `${b} ${scriptPath('session-end.mjs')}`,
+        timeout: 20
       }]
     }
   };
@@ -127,18 +128,40 @@ function mergeHooks(settings, hookConfig) {
   return added;
 }
 
-// Merge MCP server into settings
-function mergeMcp(settings) {
-  if (!settings.mcpServers) settings.mcpServers = {};
-
-  if (settings.mcpServers['local-mem']) {
-    console.log('  [SKIP] MCP server local-mem ya existe.');
-    return false;
+// Register MCP server via claude mcp add (scope user)
+function registerMcp() {
+  try {
+    // Check if already registered
+    const existing = execSync('claude mcp list 2>&1', { encoding: 'utf8', timeout: 10000 });
+    if (existing.includes('local-mem')) {
+      console.log('  [SKIP] MCP server local-mem ya registrado.');
+      return false;
+    }
+  } catch {
+    // claude CLI may not be available or mcp list failed — continue with registration
   }
 
+  try {
+    const serverPath = join(PROJECT_PATH, 'mcp', 'server.mjs');
+    const cmd = `claude mcp add --scope user local-mem "${BUN_PATH}" "${serverPath}"`;
+    execSync(cmd, { encoding: 'utf8', timeout: 15000 });
+    return true;
+  } catch (e) {
+    // Fallback: write to settings.json mcpServers for backwards compat
+    console.warn(`  [WARN] claude mcp add fallo (${e.message}). Usando fallback settings.json.`);
+    return 'fallback';
+  }
+}
+
+// Fallback: merge MCP into settings.json if claude mcp add fails
+function mergeMcpFallback(settings) {
+  if (!settings.mcpServers) settings.mcpServers = {};
+  if (settings.mcpServers['local-mem']) {
+    return false;
+  }
   settings.mcpServers['local-mem'] = {
     command: BUN_PATH,
-    args: [`${PROJECT_PATH}/mcp/server.mjs`],
+    args: [join(PROJECT_PATH, 'mcp', 'server.mjs')],
     env: {}
   };
   return true;
@@ -216,11 +239,17 @@ async function main() {
     console.log(`  [OK] Hooks agregados: ${addedHooks.join(', ')}`);
   }
 
-  // 7. Merge MCP
-  console.log('\nMergeando MCP server...');
-  const mcpAdded = mergeMcp(settings);
-  if (mcpAdded) {
-    console.log('  [OK] MCP server local-mem agregado.');
+  // 7. Register MCP via claude mcp add
+  console.log('\nRegistrando MCP server...');
+  const mcpResult = registerMcp();
+  let mcpFallbackUsed = false;
+  if (mcpResult === true) {
+    console.log('  [OK] MCP server registrado via claude mcp add.');
+  } else if (mcpResult === 'fallback') {
+    mcpFallbackUsed = mergeMcpFallback(settings);
+    if (mcpFallbackUsed) {
+      console.log('  [OK] MCP server agregado a settings.json (fallback).');
+    }
   }
 
   // 8. Atomic write
