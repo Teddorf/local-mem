@@ -67,16 +67,14 @@ function getToolsAndFiles(sessionId) {
     const filesRead = new Set();
     const filesModified = new Set();
 
+    const WRITE_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
     for (const row of rows) {
       if (row.tool_name) toolsCounts[row.tool_name] = (toolsCounts[row.tool_name] || 0) + 1;
       if (row.files) {
         let files;
         try { files = JSON.parse(row.files); } catch { files = [row.files]; }
         if (!Array.isArray(files)) files = [files];
-        const action = (row.action || '').toLowerCase();
-        const isWrite = action.includes('write') || action.includes('edit') ||
-                        action.includes('creat') || action.includes('modif') ||
-                        action.includes('delet') || action.includes('updat');
+        const isWrite = WRITE_TOOLS.has(row.tool_name);
         for (const f of files) {
           if (f && typeof f === 'string') {
             if (isWrite) filesModified.add(f);
@@ -100,8 +98,9 @@ try {
   const input = await readStdin();
   const { session_id, cwd, transcript_path } = input;
 
-  if (!session_id) {
-    process.stderr.write('[local-mem] session-end: missing session_id\n');
+  if (!session_id || !cwd) {
+    if (!session_id) process.stderr.write('[local-mem] session-end: missing session_id\n');
+    if (!cwd) process.stderr.write('[local-mem] session-end: missing cwd\n');
     process.exit(0);
   }
 

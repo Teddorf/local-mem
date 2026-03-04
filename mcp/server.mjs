@@ -3,7 +3,6 @@
 // Protocol version: 2025-03-26
 
 import {
-  getDb,
   normalizeCwd,
   searchObservations,
   getRecentObservations,
@@ -23,9 +22,8 @@ import { redactObject } from '../scripts/redact.mjs';
 import { sanitizeXml, truncate } from '../scripts/redact.mjs';
 
 // ---------------------------------------------------------------------------
-// Persistent DB connection + CWD
+// CWD
 // ---------------------------------------------------------------------------
-const db = getDb();
 const cwd = normalizeCwd(process.cwd());
 
 const log = (msg) => process.stderr.write(`[local-mem] ${msg}\n`);
@@ -420,7 +418,7 @@ async function executeTool(name, params) {
     // ---- search ----
     case 'search': {
       if (!params.query || typeof params.query !== 'string') {
-        return { error: { code: -32602, message: 'Missing required param: query' } };
+        return toolError('Missing required param: query');
       }
       const limit = Math.min(Math.max(parseInt(params.limit, 10) || 20, 1), 100);
       const results = searchObservations(params.query, cwd, { limit });
@@ -438,7 +436,7 @@ async function executeTool(name, params) {
     case 'session_detail': {
       const sid = params.session_id || null;
       const detail = getSessionDetail(sid, cwd);
-      if (!detail) return toolError('Session not found');
+      if (!detail) return toolResult(null);
       return toolResult(detail);
     }
 
@@ -466,17 +464,17 @@ async function executeTool(name, params) {
     // ---- forget ----
     case 'forget': {
       if (!params.type || !['observation', 'prompt', 'snapshot'].includes(params.type)) {
-        return { error: { code: -32602, message: 'Invalid type. Must be observation, prompt, or snapshot' } };
+        return toolError('Invalid type. Must be observation, prompt, or snapshot');
       }
       if (!Array.isArray(params.ids) || params.ids.length === 0) {
-        return { error: { code: -32602, message: 'ids must be a non-empty array of numbers' } };
+        return toolError('ids must be a non-empty array of numbers');
       }
       if (params.ids.length > 50) {
-        return { error: { code: -32602, message: 'Max 50 IDs per request' } };
+        return toolError('Max 50 IDs per request');
       }
       const ids = params.ids.map(id => Number(id)).filter(id => Number.isInteger(id) && id > 0);
       if (ids.length !== params.ids.length) {
-        return { error: { code: -32602, message: 'All IDs must be positive integers' } };
+        return toolError('All IDs must be positive integers');
       }
       try {
         const deleted = forgetRecords(params.type, ids, cwd);
@@ -484,7 +482,7 @@ async function executeTool(name, params) {
         return toolResult({ deleted });
       } catch (e) {
         if (e.code === -32602) {
-          return { error: { code: -32602, message: e.message } };
+          return toolError(e.message);
         }
         throw e;
       }
@@ -494,13 +492,13 @@ async function executeTool(name, params) {
     case 'context': {
       const ctx = getRecentContext(cwd);
       const md = formatContextMarkdown(ctx);
-      return toolResult(md);
+      return { content: [{ type: 'text', text: md }] };
     }
 
     // ---- save_state ----
     case 'save_state': {
       if (!params.current_task || typeof params.current_task !== 'string') {
-        return { error: { code: -32602, message: 'Missing required param: current_task' } };
+        return toolError('Missing required param: current_task');
       }
 
       // Validate field sizes (max 10KB each)
@@ -513,14 +511,14 @@ async function executeTool(name, params) {
         if (params[f] !== undefined) {
           const val = typeof params[f] === 'string' ? params[f] : JSON.stringify(params[f]);
           if (val.length > MAX_FIELD) {
-            return { error: { code: -32602, message: `Field ${f} exceeds 10KB limit` } };
+            return toolError(`Field ${f} exceeds 10KB limit`);
           }
         }
       }
 
       const sessionId = getActiveSession(cwd);
       if (!sessionId) {
-        return { error: { code: -32602, message: 'No active session found for this project' } };
+        return toolError('No active session found for this project');
       }
 
       // Redact all fields before saving
@@ -549,7 +547,7 @@ async function executeTool(name, params) {
     case 'status': {
       const data = getStatusData(cwd);
       const text = formatStatus(data);
-      return toolResult(text);
+      return { content: [{ type: 'text', text }] };
     }
 
     default:
@@ -622,13 +620,6 @@ async function handleMessage(msg) {
 
       try {
         const result = await executeTool(toolName, toolParams);
-
-        // If executeTool returned a structured error (from param validation)
-        if (result.error) {
-          send(jsonrpcError(id, result.error.code, result.error.message));
-          return;
-        }
-
         send(jsonrpcResult(id, result));
       } catch (err) {
         log(`Tool error [${toolName}]: ${err.message}`);
@@ -667,7 +658,9 @@ process.stdin.on('data', (chunk) => {
     if (line) {
       try {
         const msg = JSON.parse(line);
-        handleMessage(msg);
+        handleMessage(msg).catch(e => {
+          log(`handleMessage error: ${e.message}`);
+        });
       } catch (e) {
         // JSON parse error
         send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
@@ -685,9 +678,7 @@ function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   log('Shutting down');
-  try {
-    db.close();
-  } catch {}
+  // DB connections are managed per-call by db.mjs functions
   process.exit(0);
 }
 
