@@ -1,4 +1,5 @@
 import { basename } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { readStdin } from './stdin.mjs';
 import {
   abandonOrphanSessions,
@@ -6,6 +7,26 @@ import {
   getRecentContext,
 } from './db.mjs';
 import { sanitizeXml, truncate } from './redact.mjs';
+
+async function checkForUpdate() {
+  try {
+    const pkg = JSON.parse(readFileSync(import.meta.dirname + '/../package.json', 'utf8'));
+    const localVersion = pkg.version;
+
+    const resp = await fetch(
+      'https://raw.githubusercontent.com/Teddorf/local-mem/main/package.json',
+      { signal: AbortSignal.timeout(3000) }
+    );
+    if (!resp.ok) return null;
+    const remote = await resp.json();
+    if (remote.version && remote.version !== localVersion) {
+      return { local: localVersion, remote: remote.version };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 function formatRelativeTime(epochSeconds) {
   if (!epochSeconds) return '';
@@ -202,6 +223,8 @@ async function main() {
 
   const project = basename(cwd);
 
+  const updatePromise = checkForUpdate();
+
   abandonOrphanSessions(cwd, 4);
   ensureSession(sessionId, project, cwd);
 
@@ -212,6 +235,11 @@ async function main() {
     markdown = buildWelcomeContext();
   } else {
     markdown = buildHistoricalContext(project, observations, summary, snapshot);
+  }
+
+  const update = await updatePromise;
+  if (update) {
+    markdown += `\n<local-mem-data type="update-notice">\nNueva version disponible: v${update.remote} (actual: v${update.local}). Ejecuta: cd ${import.meta.dirname}/.. && git pull\n</local-mem-data>`;
   }
 
   const output = {

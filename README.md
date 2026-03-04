@@ -251,6 +251,19 @@ Survives `git clean`. Not inside any project repository. Not synced by default (
 
 ---
 
+## Documentation
+
+| Guide | Description |
+|-------|-------------|
+| [GETTING_STARTED.md](GETTING_STARTED.md) | Installation, verification, and first test — start here |
+| [USAGE_GUIDE.md](USAGE_GUIDE.md) | Complete reference for all 10 MCP tools, hooks, workflows, and testing |
+| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Common errors, diagnostics, FAQ, and maintenance |
+| [SECURITY.md](SECURITY.md) | Security model, secret redaction, attack surface analysis |
+| [SPEC.md](SPEC.md) | Full technical specification (schema, protocols, functions) |
+| [docs/decisions/](docs/decisions/) | Architecture Decision Records (ADR 001–010) |
+
+---
+
 ## License
 
 MIT

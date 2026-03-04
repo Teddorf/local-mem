@@ -1,12 +1,30 @@
 # SPEC: local-mem — Memoria persistente local para Claude Code
 
-**Version**: 0.4.4
+**Version**: 0.5.0
 **Fecha**: 2026-03-04
 **Status**: Draft
 
 ---
 
 ## Changelog del SPEC
+
+### [0.5.0] — 2026-03-04
+#### FIX CRITICO: MCP server no conecta — config en archivo incorrecto
+- FIX: Claude Code NO lee MCP servers desde `settings.json`. Los lee de `~/.claude.json` (scope user) o `.mcp.json` (scope project), o via CLI `claude mcp add`
+- FIX: Instalador debe registrar MCP server via `claude mcp add --scope user` en vez de escribir en `settings.json.mcpServers`
+- FIX: Desinstalador debe usar `claude mcp remove local-mem` en vez de limpiar `settings.json.mcpServers`
+- FIX: Hooks siguen en `settings.json` (correcto). Solo `mcpServers` cambia de ubicacion
+- FIX: Seccion "MCP Server en settings.json" renombrada a "MCP Server (registro via CLI)"
+- FIX: Seccion "Archivo a modificar" actualizada para reflejar los dos archivos: `settings.json` (hooks) y `~/.claude.json` (MCP server via CLI)
+- FIX: Health check (`status.mjs`) debe verificar MCP en `~/.claude.json` en vez de `settings.json`
+- ROOT CAUSE: Diagnostico completo en sesion de research — servidor MCP funciona correctamente (protocolo, stdout/stderr, JSON-RPC), pero Claude Code nunca lo spawneaba porque buscaba config en otro archivo
+
+### [0.4.5] — 2026-03-04
+#### Update check no-bloqueante
+- ADD: `checkForUpdate()` en SessionStart — fetch al `package.json` de GitHub con `AbortSignal.timeout(3000)`, compara version local vs remota
+- ADD: Se lanza en paralelo con queries DB (no agrega latencia al startup)
+- ADD: Si hay version nueva, agrega tag `<local-mem-data type="update-notice">` al contexto inyectado con instrucciones de actualizacion (`git pull`)
+- ADD: Silencioso si falla (sin internet, timeout, error de red — retorna null)
 
 ### [0.4.4] — 2026-03-04
 #### Integracion de sistemas
@@ -736,10 +754,12 @@ if (!validateInput(input, ['session_id', 'cwd'])) {
 2. Usa `cwd` del stdin (NO `process.cwd()` que puede diferir en algunos contextos)
 3. Usa `source` para saber si es `startup`, `resume`, `clear`, o `compact`
 4. Ejecuta `abandonOrphanSessions(cwd, 4)` — marca sesiones active de mas de 4 horas como `abandoned` **SOLO para el cwd actual** (no toca sesiones de otros proyectos)
-5. Consulta DB: ultimas 30 observaciones + ultimo resumen + ultimo snapshot **filtrado por cwd**
-6. Si es la primera sesion (0 observaciones previas), muestra mensaje de bienvenida
+5. Lanza `checkForUpdate()` en paralelo (fetch no-bloqueante al `package.json` de GitHub, timeout 3s)
+6. Consulta DB: ultimas 30 observaciones + ultimo resumen + ultimo snapshot **filtrado por cwd**
+7. Si es la primera sesion (0 observaciones previas), muestra mensaje de bienvenida
+8. Si `checkForUpdate()` retorno version nueva, agrega `<local-mem-data type="update-notice">` al contexto
 7. Formatea como markdown con delimitadores fuertes
-8. Output:
+9. Output:
 ```json
 {
   "hookSpecificOutput": {
@@ -748,7 +768,7 @@ if (!validateInput(input, ['session_id', 'cwd'])) {
   }
 }
 ```
-7. Exit code 0
+10. Exit code 0
 
 ### Formato del contexto inyectado:
 
@@ -1096,8 +1116,8 @@ Script interactivo que:
 6. **NUEVO**: Crea backup `~/.claude/settings.json.bak` antes de modificar
 7. Detecta si hay otros plugins de memoria habilitados y pregunta si deshabilitarlos
 8. Agrega la seccion `hooks` apuntando a los scripts (MERGE con hooks existentes, no reemplaza)
-9. Agrega el MCP server en `mcpServers`
-10. **NUEVO**: Escribe settings.json de forma atomica (write `.tmp` + rename)
+9. Registra MCP server via `claude mcp add --scope user --transport stdio local-mem -- <bun> <server.mjs>` (NO en settings.json)
+10. **NUEVO**: Escribe settings.json de forma atomica (write `.tmp` + rename) — solo para hooks
 11. Muestra resumen de cambios realizados
 12. Muestra como verificar que funciona (`bun <path>/scripts/status.mjs`)
 13. **NUEVO**: Muestra advertencia si detecta que la DB esta en un directorio sincronizado con cloud (OneDrive, Dropbox, iCloud)
@@ -1162,8 +1182,16 @@ for (const event of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Session
 }
 ```
 
-### MCP Server en settings.json:
+### MCP Server (registro via CLI):
 
+Claude Code **NO lee MCP servers desde `settings.json`**. Los lee de `~/.claude.json` (scope user) o `.mcp.json` (scope project).
+
+**Registro via CLI** (metodo recomendado):
+```bash
+claude mcp add --scope user --transport stdio local-mem -- "<bun-path>" "<project-path>/mcp/server.mjs"
+```
+
+**Resultado en `~/.claude.json`**:
 ```json
 {
   "mcpServers": {
@@ -1178,6 +1206,8 @@ for (const event of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Session
 
 **Nota**: los paths se resuelven dinamicamente en el instalador usando `process.execPath` para bun y `import.meta.dirname` para el proyecto. **CRITICO**: Ambos paths DEBEN estar envueltos en comillas dobles (`"path"`) en el campo `command` para soportar rutas con espacios (comun en Windows: `C:\Users\Mike Bennett\...`). El instalador genera los commands con quoting automatico.
 
+**IMPORTANTE**: `settings.json` solo se usa para hooks y permissions. La seccion `mcpServers` en `settings.json` es ignorada por Claude Code.
+
 ---
 
 ## Componente 7: Desinstalador (`uninstall.mjs`)
@@ -1185,8 +1215,8 @@ for (const event of ['SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Session
 1. Lee `~/.claude/settings.json`
 2. Crea backup `settings.json.bak`
 3. Remueve la seccion `hooks` (solo las entries que contienen 'local-mem' en el command)
-4. Remueve `mcpServers.local-mem`
-5. Escribe de forma atomica (`.tmp` + rename)
+4. Remueve MCP server via `claude mcp remove local-mem` (NO edita settings.json para esto)
+5. Escribe de forma atomica (`.tmp` + rename) — solo para hooks
 6. NO borra la base de datos (preserva datos del usuario)
 7. Muestra instrucciones para borrar `~/.local-mem/data/` manualmente si lo desea
 
@@ -1438,9 +1468,10 @@ Todos los componentes resuelven la DB por la misma via:
 
 ---
 
-## Archivo a modificar
+## Archivos a modificar
 
-- `~/.claude/settings.json` — via install.mjs (merge hooks + mcpServers, con backup + atomic write)
+- `~/.claude/settings.json` — via install.mjs (merge hooks solamente, con backup + atomic write)
+- `~/.claude.json` — via `claude mcp add` (registro de MCP server, gestionado por Claude Code CLI)
 
 ---
 
