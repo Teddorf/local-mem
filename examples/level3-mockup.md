@@ -12,6 +12,8 @@ Busca en memoria con las herramientas MCP de local-mem para mas detalle.
 ## Sesion anterior (hace 8h)
 - Pendiente: Implementar refresh token en flujo OAuth
 - Decisiones sin resolver: Token rotation: silent refresh vs explicit re-auth; Storage: httpOnly cookie vs localStorage
+- Estado tecnico al cerrar: 0 TS errors, tests OK (18/18)
+- Confianza al cerrar: 2/5
 - Edit: scaffold de rutas /auth/google y /auth/google/callback
 - Edit: configuracion passport-google-oauth20
 - Bash: npm install passport-google-oauth20 [exit 0]
@@ -25,6 +27,7 @@ Busca en memoria con las herramientas MCP de local-mem para mas detalle.
 - Siguiente: Escribir test e2e en tests/e2e/oauth-flow.test.ts usando el helper de auth que ya existe en tests/helpers/auth.ts
 - Decisiones abiertas: Token rotation: silent refresh vs explicit re-auth (depende de UX review), Storage: httpOnly cookie vs localStorage (security tradeoff pendiente de definir con equipo)
 - Bloqueantes: Google OAuth sandbox tiene rate limit de 100 req/min — e2e tests pueden fallar si corren en paralelo
+- Confianza: 3/5 — tests pasan pero no revisado
 
 ## Razonamiento reciente de Claude
 - [14:12] Analice el flujo de refresh token. El patron actual usa interceptor en axios que detecta 401, intenta refresh, y reintenta el request original. Pero hay un edge case: si 2 requests fallan simultaneamente, ambos intentan refresh y uno falla por token ya usado. Solucion: mutex/queue para serializar refreshes.

@@ -166,8 +166,55 @@ No es un dump de `summary_text`. Es data estructurada de 5 tablas, ordenada por 
 - ADD: Auto-snapshot captura archivos activos de ultimas 25 obs
 - ADD: Cross-session curada (queryCuratedPrevSession + queryPrevHighImpactActions + renderCrossSession)
 
+##### Fase 4 — Vibe awareness (adoptado de vibe_snapshot)
+
+**Origen**: Analisis de la skill `/vibe_snapshot` — 3 features adoptables para local-mem.
+
+###### 4a. Technical state en auto-snapshot
+- ADD: Al generar auto-snapshot (cada 25 obs), capturar estado tecnico del proyecto:
+  - `ts_errors`: cantidad de errores TypeScript (`npx tsc --noEmit 2>&1 | grep -c 'error TS'`)
+  - `test_summary`: resultado de tests (`bun test 2>&1 | tail -3`)
+  - `lint_warnings`: warnings de lint si hay linter configurado
+- ADD: Nuevo campo `technical_state` (JSON) en tabla `execution_snapshots`
+- ADD: Schema migration v3: `ALTER TABLE execution_snapshots ADD COLUMN technical_state TEXT`
+- ADD: Auto-snapshot corre los checks en background con timeout de 10s (no bloquea el hook)
+- ADD: Deteccion automatica: solo corre `tsc` si existe `tsconfig.json`, solo corre `bun test` si existe directorio `tests/` o `__tests__/`
+- RENDER: En cross-session curada: "Estado tecnico al cerrar: 3 TS errors, 1 test fallando" o "Estado tecnico al cerrar: limpio (0 errors, tests OK)"
+- NOTA: Si los comandos fallan o timeout, se omite silenciosamente. No es bloqueante.
+
+###### 4b. Confidence level en save_state
+- ADD: Nuevo parametro opcional `confidence` (integer 1-5) en tool `save_state`
+- ADD: Nuevo campo `confidence` (INTEGER) en tabla `execution_snapshots`
+- ADD: Schema migration v3: `ALTER TABLE execution_snapshots ADD COLUMN confidence INTEGER`
+- ADD: Claude infiere el nivel del contexto al guardar estado:
+  - 1: Explorando, no se si funciona
+  - 2: Implementado parcialmente, no testeado
+  - 3: Implementado, tests pasan pero no revisado
+  - 4: Tests pasan, revisado, falta probar manualmente
+  - 5: Todo OK, listo para merge/deploy
+- RENDER: En contexto inyectado: "Confianza: 3/5 — tests pasan pero no revisado"
+- RENDER: En cross-session curada: "Confianza al cerrar: 4/5"
+- NOTA: Si no se pasa, no se muestra. No es obligatorio.
+
+###### 4c. Validez de contexto en session-start
+- ADD: En `session-start.mjs`, al inyectar nivel 2+ con cross-session, verificar si `active_files` del snapshot anterior cambiaron fuera de Claude Code
+- ADD: `checkContextValidity(snapshot)` — para cada archivo en `active_files`, comparar `git log --since={snapshot.created_at} -- {file}` para detectar commits externos
+- ADD: Si hay archivos modificados externamente, agregar warning al contexto:
+  ```
+  ## Aviso de contexto
+  - Archivos modificados fuera de Claude Code desde el ultimo snapshot: src/auth/jwt.ts (2 commits), tests/auth.test.ts (1 commit)
+  - El contexto puede estar desactualizado — verificar antes de continuar
+  ```
+- NOTA: Solo se ejecuta si hay snapshot con `active_files` no vacio. Timeout 5s para git. Si falla, se omite silenciosamente.
+- NOTA: No bloquea — es un warning informativo, no impide la inyeccion de contexto.
+
 ##### Fix
 - FIX: SessionEnd timeout settings.json 15s -> 20s
+
+##### Schema migration v2 → v3
+- ADD: `ALTER TABLE execution_snapshots ADD COLUMN technical_state TEXT`
+- ADD: `ALTER TABLE execution_snapshots ADD COLUMN confidence INTEGER`
+- ADD: `schema_version` actualizada a v3
 
 ##### Diseno detallado
 - Ver `PROGRESSIVE_DISCLOSURE.md` para queries SQL completas, logica de renderer, y mockups de output por nivel

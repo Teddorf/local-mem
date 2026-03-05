@@ -212,6 +212,8 @@ function renderCrossSession(lines, prevData, prevActions) {
 - Pendiente: Escribir test e2e en tests/e2e/oauth-flow.test.ts usando helper de auth
 - Decisiones sin resolver: Token rotation: silent refresh vs explicit re-auth; Storage: httpOnly cookie vs localStorage
 - Bloqueantes: Google OAuth sandbox rate limit 100 req/min en e2e
+- Estado tecnico al cerrar: 0 TS errors, tests OK (23/23)
+- Confianza al cerrar: 3/5
 - Edit: agrego generateRefreshToken() y validateRefreshToken() en jwt.ts
 - Edit: endpoint POST /auth/refresh con validacion
 - Edit: cleanup.ts — cron job para limpiar tokens expirados
@@ -226,9 +228,148 @@ function renderCrossSession(lines, prevData, prevActions) {
 1. Pendiente (que hay que hacer)
 2. Decisiones sin resolver (que hay que decidir)
 3. Bloqueantes (que puede frenar)
-4. Acciones de impacto (que se toco)
-5. Ultimo razonamiento (como se estaba pensando)
-6. Ultimo pedido (que queria el usuario)
+4. Estado tecnico (TS errors, tests — si algo esta roto, hay que arreglarlo primero)
+5. Confianza (que tan seguro estaba Claude de que funciona)
+6. Acciones de impacto (que se toco)
+7. Ultimo razonamiento (como se estaba pensando)
+8. Ultimo pedido (que queria el usuario)
+
+---
+
+## Vibe awareness (adoptado de /vibe_snapshot)
+
+### 4a. Technical state en auto-snapshot
+
+Al generar auto-snapshot (cada 25 obs), capturar estado tecnico:
+
+```js
+async function captureTechnicalState(cwd) {
+  const state = {};
+  const timeout = 10_000; // 10s max
+
+  // Solo si existe tsconfig.json
+  try {
+    statSync(join(cwd, 'tsconfig.json'));
+    const { stdout } = await execAsync('npx tsc --noEmit 2>&1 | grep -c "error TS"',
+      { cwd, timeout });
+    state.ts_errors = parseInt(stdout.trim()) || 0;
+  } catch { /* no tsconfig or timeout — skip */ }
+
+  // Solo si existe tests/ o __tests__/
+  try {
+    const hasTests = existsSync(join(cwd, 'tests')) || existsSync(join(cwd, '__tests__'));
+    if (hasTests) {
+      const { stdout } = await execAsync('bun test 2>&1 | tail -3',
+        { cwd, timeout });
+      state.test_summary = stdout.trim();
+    }
+  } catch { /* timeout or no tests — skip */ }
+
+  return Object.keys(state).length > 0 ? JSON.stringify(state) : null;
+}
+```
+
+**Donde se guarda**: `execution_snapshots.technical_state` (TEXT, JSON)
+
+**Donde se renderiza**: En `renderCrossSession()`, despues de bloqueantes:
+```js
+if (prevData.technical_state) {
+  const ts = parseJsonSafe(prevData.technical_state);
+  const parts = [];
+  if (ts.ts_errors !== undefined) parts.push(`${ts.ts_errors} TS errors`);
+  if (ts.test_summary) parts.push(ts.test_summary);
+  if (parts.length > 0) {
+    lines.push(`- Estado tecnico al cerrar: ${parts.join(', ')}`);
+  }
+}
+```
+
+### 4b. Confidence level en save_state
+
+Nuevo param en el tool MCP `save_state`:
+
+```js
+confidence: {
+  type: 'integer',
+  minimum: 1,
+  maximum: 5,
+  description: 'Confidence level 1-5: 1=exploring, 2=partial, 3=tests pass, 4=reviewed, 5=ready to ship'
+}
+```
+
+**Donde se guarda**: `execution_snapshots.confidence` (INTEGER)
+
+**Donde se renderiza**:
+- En snapshot actual: `- Confianza: 3/5 — tests pasan pero no revisado`
+- En cross-session curada: `- Confianza al cerrar: 4/5`
+
+```js
+// En renderSnapshot()
+if (snapshot.confidence) {
+  const labels = {
+    1: 'explorando, no se si funciona',
+    2: 'implementado parcialmente, no testeado',
+    3: 'tests pasan pero no revisado',
+    4: 'revisado, falta probar manualmente',
+    5: 'listo para merge/deploy'
+  };
+  lines.push(`- Confianza: ${snapshot.confidence}/5 — ${labels[snapshot.confidence]}`);
+}
+
+// En renderCrossSession()
+if (prevData.confidence) {
+  lines.push(`- Confianza al cerrar: ${prevData.confidence}/5`);
+}
+```
+
+### 4c. Validez de contexto en session-start
+
+Verificar si `active_files` del snapshot anterior cambiaron fuera de Claude Code:
+
+```js
+function checkContextValidity(snapshot, cwd) {
+  if (!snapshot?.active_files) return null;
+
+  const files = parseJsonSafe(snapshot.active_files);
+  if (!files?.length) return null;
+
+  const snapshotEpoch = snapshot.created_at;
+  const sinceDate = new Date(snapshotEpoch * 1000).toISOString();
+  const changed = [];
+
+  for (const file of files.slice(0, 10)) { // max 10 files
+    try {
+      const { stdout } = execSync(
+        `git log --oneline --since="${sinceDate}" -- "${file}"`,
+        { cwd, timeout: 5000, encoding: 'utf8' }
+      );
+      const commits = stdout.trim().split('\n').filter(Boolean);
+      if (commits.length > 0) {
+        changed.push({ file, commits: commits.length });
+      }
+    } catch { /* not in git, timeout, etc — skip */ }
+  }
+
+  return changed.length > 0 ? changed : null;
+}
+```
+
+**Donde se renderiza**: En `buildHistoricalContext()`, nivel 2+, despues del snapshot:
+
+```js
+if (level >= 2 && snapshot) {
+  const staleFiles = checkContextValidity(snapshot, cwd);
+  if (staleFiles) {
+    lines.push(``);
+    lines.push(`## Aviso de contexto`);
+    const fileList = staleFiles.map(f =>
+      `${sanitizeXml(f.file)} (${f.commits} commit${f.commits > 1 ? 's' : ''})`
+    ).join(', ');
+    lines.push(`- Archivos modificados fuera de Claude Code desde el ultimo snapshot: ${fileList}`);
+    lines.push(`- El contexto puede estar desactualizado — verificar antes de continuar`);
+  }
+}
+```
 
 ---
 
@@ -249,6 +390,8 @@ Busca en memoria con las herramientas MCP de local-mem para mas detalle.
 - Pendiente: Escribir test e2e en tests/e2e/oauth-flow.test.ts
 - Decisiones sin resolver: Token rotation: silent refresh vs explicit re-auth; Storage: httpOnly cookie vs localStorage
 - Bloqueantes: Google OAuth sandbox rate limit 100 req/min
+- Estado tecnico al cerrar: 0 TS errors, tests OK (23/23)
+- Confianza al cerrar: 3/5
 - Edit: agrego generateRefreshToken() en jwt.ts
 - Edit: endpoint POST /auth/refresh
 - Edit: cleanup.ts — cron job tokens expirados
@@ -262,6 +405,11 @@ Busca en memoria con las herramientas MCP de local-mem para mas detalle.
 - Siguiente: Escribir test e2e en tests/e2e/oauth-flow.test.ts
 - Decisiones abiertas: Token rotation: silent refresh vs explicit re-auth, Storage: httpOnly cookie vs localStorage
 - Bloqueantes: Google OAuth sandbox rate limit 100 req/min
+- Confianza: 3/5 — tests pasan pero no revisado
+
+## Aviso de contexto
+- Archivos modificados fuera de Claude Code desde el ultimo snapshot: src/services/auth/jwt.ts (1 commit)
+- El contexto puede estar desactualizado — verificar antes de continuar
 
 ## Razonamiento de la sesion anterior
 - [11:45] Decidi usar passport-google-oauth20. Libreria maneja flujo completo, 2M downloads/week.
@@ -407,6 +555,8 @@ function queryCuratedPrevSession(db, nCwd) {
       es.open_decisions,
       es.blocking_issues,
       es.active_files,
+      es.technical_state,
+      es.confidence,
       (SELECT prompt_text FROM user_prompts
        WHERE session_id = ps.session_id
        ORDER BY created_at DESC LIMIT 1) AS last_prompt,
@@ -609,14 +759,15 @@ additionalContext = markdown              <- inyectado en system-reminder
 | Seccion | Hoy | Nivel 1 | Nivel 2 | Nivel 3 |
 |---------|-----|---------|---------|---------|
 | Resumen | full | 1-liner | full | full |
-| Sesion anterior | - | - | **resultado + decisiones** | si pocas obs |
-| Snapshot | full | tarea+paso | full | full |
+| Cross-session curada | - | - | **si** | **si** |
+| Aviso de contexto | - | - | **si** | **si** |
+| Snapshot | full | tarea+paso | full + **confianza** | full + **confianza** |
+| Technical state | - | - | **si (en cross-session)** | **si (en cross-session)** |
 | Thinking | 5 blocks | - | **3 blocks** | 5 blocks |
 | Prompts | 3 | 1 | **5** | 5 |
 | Acciones | 5 | - | 5 | **10** |
 | Top relevancia | 7 | - | 7 | **10** |
 | Sesiones index | 3 (1 compact) | - | 3 | 1 |
-| Cross-session | - | - | **si (curada)** | **si (curada)** |
 
 Mejoras vs actual en negrita.
 
@@ -624,11 +775,13 @@ Mejoras vs actual en negrita.
 
 ## Orden de implementacion
 
-1. `db.mjs`: agregar `queryPrevSummary()`, `queryPrevSnapshot()`, parametrizar `getRecentContext()` con `level`
-2. `session-start.mjs`: agregar `getDisclosureLevel()`, pasar `level` al flujo
-3. `session-start.mjs`: refactorear `buildHistoricalContext()` con render condicional
-4. Test manual: verificar output de cada nivel con datos reales
-5. Actualizar SPEC con la feature
+1. `db.mjs`: schema migration v3 (technical_state, confidence), parametrizar `getRecentContext()` con `level`, agregar `queryCuratedPrevSession()` y `queryPrevHighImpactActions()`
+2. `mcp/server.mjs`: agregar `confidence` param a `save_state`
+3. `session-start.mjs`: agregar `getDisclosureLevel()`, pasar `level` al flujo
+4. `session-start.mjs`: refactorear `buildHistoricalContext()` con render condicional
+5. `session-start.mjs`: agregar `checkContextValidity()` para avisos de archivos modificados
+6. `observation.mjs`: agregar `captureTechnicalState()` en auto-snapshot
+7. Test manual: verificar output de cada nivel con datos reales
 
 ---
 
