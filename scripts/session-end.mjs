@@ -56,11 +56,14 @@ function extractTranscriptSummary(transcriptPath) {
   }
 }
 
+const MAX_TRANSCRIPT = 20 * 1024 * 1024; // 20MB — thinking blocks are spread throughout
+
 async function extractThinkingFromTranscript(transcriptPath, sessionId, cwd) {
   let buf;
   try { buf = readFileSync(transcriptPath); } catch { return; }
-  const slice = buf.length > LAST_200KB
-    ? buf.slice(buf.length - LAST_200KB).toString('utf8')
+  // Read full transcript (up to 20MB) — thinking is not just at the end
+  const slice = buf.length > MAX_TRANSCRIPT
+    ? buf.slice(buf.length - MAX_TRANSCRIPT).toString('utf8')
     : buf.toString('utf8');
 
   const lines = slice.split('\n').filter(l => l.trim());
@@ -78,8 +81,9 @@ async function extractThinkingFromTranscript(transcriptPath, sessionId, cwd) {
     let response_text = '';
 
     for (const block of contentArray) {
-      if (block.type === 'thinking' && block.text) {
-        thinking_text += (thinking_text ? '\n' : '') + block.text;
+      if (block.type === 'thinking' && (block.thinking || block.text)) {
+        const t = block.thinking || block.text;
+        thinking_text += (thinking_text ? '\n' : '') + t;
       } else if (block.type === 'text' && block.text) {
         response_text += (response_text ? '\n' : '') + block.text;
       }

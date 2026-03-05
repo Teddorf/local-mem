@@ -96,6 +96,10 @@
 ##### session_detail observations vacias
 - FIX: `db.mjs` `getSessionDetail()` — observations query filtraba por `session_id AND cwd`. Si el usuario hace CD durante la sesion, las obs se graban con el nuevo cwd mientras la sesion conserva el cwd original, resultando en 0 results. Ahora filtra solo por `session_id` (suficiente ya que session_id es unico y la sesion ya fue validada por cwd)
 
+##### Thinking capture (2 bugs criticos)
+- FIX: `session-end.mjs` `extractThinkingFromTranscript()` — buscaba `block.text` pero el transcript usa `block.thinking` como key. Ahora usa `block.thinking || block.text`
+- FIX: `session-end.mjs` — thinking extraction leia solo ultimos 200KB (LAST_200KB). En sesiones largas (9MB+) cubria solo ~2%. Nuevo cap: 20MB (MAX_TRANSCRIPT) para cobertura completa
+
 ### [0.6.3] — 2026-03-05
 #### Fixes post re-evaluacion ronda 4 (2 reviewers deep con Rol Research V2.1 --all)
 
