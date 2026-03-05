@@ -462,9 +462,9 @@ export function insertTurnLog(sessionId, cwd, turnData) {
   const nCwd = normalizeCwd(cwd);
   try {
     const thinkingText = turnData.thinking_text
-      ? turnData.thinking_text.slice(0, 2048) : null;  // max 2KB
+      ? turnData.thinking_text.slice(0, 4096) : null;  // max 4KB
     const responseText = turnData.response_text
-      ? turnData.response_text.slice(0, 1024) : null;  // max 1KB
+      ? turnData.response_text.slice(0, 2048) : null;  // max 2KB
     db.prepare(`
       INSERT INTO turn_log (session_id, cwd, turn_number, thinking_text, response_text, created_at)
       VALUES (?, ?, ?, ?, ?, unixepoch())
@@ -592,12 +592,14 @@ export function getRecentContext(cwd, opts = {}) {
       LIMIT 1
     `).get(nCwd) || null;
 
-    // v0.6: ultimo thinking block
-    const thinking = db.prepare(`
+    // v0.7: ultimos 5 thinking blocks (viejo→nuevo para contexto)
+    const thinkingRows = db.prepare(`
       SELECT thinking_text, response_text, created_at
       FROM turn_log WHERE cwd = ?
-      ORDER BY created_at DESC LIMIT 1
-    `).get(nCwd) || null;
+      ORDER BY created_at DESC LIMIT 5
+    `).all(nCwd);
+    // Reverse so oldest is first (chronological order)
+    const thinking = thinkingRows.length > 0 ? thinkingRows.reverse() : null;
 
     // v0.6: top observaciones por score con threshold dinamico (recency at query-time)
     const allScored = db.prepare(`

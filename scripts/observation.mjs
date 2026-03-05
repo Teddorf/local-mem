@@ -231,20 +231,32 @@ try {
     process.stderr.write(`[local-mem] Score error: ${e.message}\n`);
   }
 
-  // Auto-snapshot every 25 observations
+  // Auto-snapshot every 25 observations (v0.7: with active files)
   try {
     const stats = getSessionStats(session_id);
     if (stats && stats.observation_count > 0 && stats.observation_count % 25 === 0) {
-      const recentObs = getRecentObservations(cwd, { limit: 10 });
-      const lastActions = recentObs.map(o => o.action).join('\n');
-      // Capture last 3 prompts for auto-snapshot context (lightweight, 1 query)
+      const recentObs = getRecentObservations(cwd, { limit: 25 });
+      const lastActions = recentObs.slice(0, 10).map(o => o.action).join('\n');
       const recentPrompts = getRecentPrompts(cwd, 3);
       const lastPrompts = recentPrompts.map(p => p.prompt_text || '').join('\n');
+
+      // v0.7: Extract unique active files from recent observations
+      const activeFilesSet = new Set();
+      for (const obs of recentObs) {
+        if (obs.files) {
+          try {
+            const files = typeof obs.files === 'string' ? JSON.parse(obs.files) : obs.files;
+            if (Array.isArray(files)) files.forEach(f => f && activeFilesSet.add(f));
+          } catch { /* skip */ }
+        }
+      }
+
       saveExecutionSnapshot(session_id, {
         cwd,
         current_task: `Auto-snapshot at ${stats.observation_count} observations`,
         execution_point: lastActions.slice(0, 500),
         next_action: lastPrompts.slice(0, 300),
+        active_files: [...activeFilesSet].slice(0, 20),
         snapshot_type: 'auto',
         task_status: 'in_progress'
       });

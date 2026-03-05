@@ -1,6 +1,6 @@
 # SPEC: local-mem — Memoria persistente local para Claude Code
 
-**Version**: 0.6.4
+**Version**: 0.7.0-planned
 **Fecha**: 2026-03-05
 **Status**: Draft
 
@@ -80,6 +80,35 @@
 1. Thinking solo al cierre: si sesion crashea, thinking se pierde. Mitigation: auto-snapshots preservan estado
 2. Scoring estatico: no adapta pesos segun tipo de sesion. Planificado context-dependent scoring para v0.7
 3. Transcript size cap: 200KB puede no cubrir sesiones 4h+. Evaluar en uso real
+
+### [0.6.4] — 2026-03-05
+
+### [0.7.0] — 2026-03-05 (planned)
+#### Continuidad perfecta post-compact
+
+**Root cause**: Al compactar, Claude pierde plan, decisiones, razonamiento y punto de ejecucion. local-mem captura QUE hizo (tools) pero no QUE PENSO. No existe hook PreCompact.
+
+**Analisis**: 4 agentes (Datos, Hooks, Token Budget, Thinking) auditaron el sistema. Convergencia: transcript append en tiempo real, 5 thinking blocks suficientes, budget 1200 compact / 800 new session, bullets -30% tokens.
+
+##### Fase 1 — Quick wins
+- CHANGE: thinking query LIMIT 1 -> LIMIT 5 en getRecentContext()
+- CHANGE: buildHistoricalContext() renderiza 5 thinking blocks (500 chars c/u)
+- CHANGE: insertTurnLog() truncado thinking 2KB->4KB, response 1KB->2KB
+- ADD: buildHistoricalContext() diferencia compact (1200 tok) vs startup (800 tok)
+- CHANGE: Formato tablas -> bullets compactos (-30% tokens)
+- CHANGE: Prompts 80->120 chars. Merge acciones+top10 -> Top 7 por score
+
+##### Fase 2 — Captura en compact event
+- ADD: SessionStart(compact) descubre transcript via glob session_id.jsonl
+- ADD: Lee ultimos 500KB, extrae 5 thinking + ultimo response -> turn_log
+- ADD: Inyecta en additionalContext inmediatamente
+
+##### Fase 3 — Auto-save_state inteligente
+- CHANGE: Auto-snapshot extrae plan/ejecucion del thinking (no generico)
+- ADD: Auto-snapshot captura archivos activos de ultimas 25 obs
+
+##### Fix
+- FIX: SessionEnd timeout settings.json 15s -> 20s
 
 ### [0.6.4] — 2026-03-05
 #### Fixes post smoke test de integracion (12 tools, 4 hooks, ciclo completo)

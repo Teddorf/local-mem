@@ -364,11 +364,16 @@ function formatContextMarkdown(ctx) {
     }
   }
 
-  // --- Thinking (v0.6) ---
-  if (thinking && thinking.thinking_text) {
+  // --- Thinking (v0.7: up to 5 blocks) ---
+  if (thinking && thinking.length > 0) {
     lines.push('');
-    lines.push('## Ultimo razonamiento de Claude');
-    lines.push(sanitizeXml(truncate(thinking.thinking_text, 300)));
+    lines.push('## Razonamiento reciente de Claude');
+    for (const t of thinking) {
+      if (t.thinking_text) {
+        const time = t.created_at ? formatTime(t.created_at) : '?';
+        lines.push(`- [${time}] ${sanitizeXml(truncate(t.thinking_text, 500))}`);
+      }
+    }
   }
 
   // --- User prompts (v0.6) ---
@@ -377,40 +382,34 @@ function formatContextMarkdown(ctx) {
     lines.push('## Ultimos pedidos del usuario');
     for (const p of prompts) {
       const time = p.created_at ? formatTime(p.created_at) : '?';
-      const text = sanitizeXml(truncate(p.prompt_text || '', 80));
+      const text = sanitizeXml(truncate(p.prompt_text || '', 120));
       lines.push(`- [${time}] "${text}"`);
     }
   }
 
-  // --- Recent activity (top 5) ---
+  // --- Recent activity (top 5, bullets) ---
   if (observations && observations.length > 0) {
     lines.push('');
     lines.push('## Ultimas 5 acciones');
-    lines.push('');
-    lines.push('| # | Hora | Que hizo |');
-    lines.push('|---|------|----------|');
 
     for (const obs of observations.slice(0, 5)) {
       const time = obs.created_at ? formatTime(obs.created_at) : '?';
       let action = sanitizeXml(truncate(obs.action || '', 100));
       if (obs.detail) action = `${action}: ${sanitizeXml(truncate(obs.detail, 100))}`;
-      lines.push(`| ${obs.id} | ${time} | ${action} |`);
+      lines.push(`- #${obs.id} ${time} ${action}`);
     }
   }
 
-  // --- Top scored (v0.6) ---
+  // --- Top scored (v0.7: top 7, bullets) ---
   if (topScored && topScored.length > 0) {
     lines.push('');
-    lines.push('## Top 10 por relevancia');
-    lines.push('');
-    lines.push('| # | Hora | Que hizo | Score |');
-    lines.push('|---|------|----------|-------|');
+    lines.push('## Top por relevancia');
 
-    for (const obs of topScored.slice(0, 10)) {
+    for (const obs of topScored.slice(0, 7)) {
       const time = obs.created_at ? formatTime(obs.created_at) : '?';
       const action = sanitizeXml(truncate(obs.action || '', 80));
       const score = obs.composite_score != null ? Number(obs.composite_score).toFixed(2) : '';
-      lines.push(`| ${obs.id} | ${time} | ${action} | ${score} |`);
+      lines.push(`- #${obs.id} ${time} ${action} [${score}]`);
     }
   }
 
@@ -692,7 +691,7 @@ async function handleMessage(msg) {
         jsonrpcResult(id, {
           protocolVersion: '2025-03-26',
           capabilities: { tools: {} },
-          serverInfo: { name: 'local-mem', version: '0.6.4' },
+          serverInfo: { name: 'local-mem', version: '0.7.0' },
         })
       );
       break;

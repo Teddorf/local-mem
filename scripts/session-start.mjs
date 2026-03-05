@@ -1,12 +1,16 @@
 import { basename } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { readStdin } from './stdin.mjs';
 import {
   abandonOrphanSessions,
   ensureSession,
   getRecentContext,
+  insertTurnLog,
+  normalizeCwd,
 } from './db.mjs';
-import { sanitizeXml, truncate } from './redact.mjs';
+import { sanitizeXml, truncate, redact } from './redact.mjs';
 
 async function checkForUpdate() {
   try {
@@ -58,7 +62,8 @@ Tools disponibles via MCP: search, save_state, context, forget, status, recent, 
 </local-mem-data>`;
 }
 
-function buildHistoricalContext(project, ctx) {
+function buildHistoricalContext(project, ctx, source) {
+  const isCompact = source === 'compact';
   const { observations, summary, snapshot, thinking, topScored, prompts, recentSessions } = ctx;
 
   const lines = [];
@@ -171,11 +176,16 @@ function buildHistoricalContext(project, ctx) {
     }
   }
 
-  // --- Ultimo razonamiento de Claude ---
-  if (thinking && thinking.thinking_text) {
+  // --- Razonamiento reciente de Claude (hasta 5 bloques) ---
+  if (thinking && thinking.length > 0) {
     lines.push(``);
-    lines.push(`## Ultimo razonamiento de Claude`);
-    lines.push(sanitizeXml(truncate(thinking.thinking_text, 300)));
+    lines.push(`## Razonamiento reciente de Claude`);
+    for (const t of thinking) {
+      if (t.thinking_text) {
+        const hora = sanitizeXml(formatHour(t.created_at));
+        lines.push(`- [${hora}] ${sanitizeXml(truncate(t.thinking_text, 500))}`);
+      }
+    }
   }
 
   // --- Ultimos pedidos del usuario ---
@@ -184,19 +194,16 @@ function buildHistoricalContext(project, ctx) {
     lines.push(`## Ultimos pedidos del usuario`);
     for (const p of prompts) {
       const hora = sanitizeXml(formatHour(p.created_at));
-      const text = sanitizeXml(truncate(p.prompt_text || '', 80));
+      const text = sanitizeXml(truncate(p.prompt_text || '', 120));
       lines.push(`- [${hora}] "${text}"`);
     }
   }
 
-  // --- Ultimas 5 acciones ---
+  // --- Ultimas 5 acciones (bullets, compact) ---
   if (observations && observations.length > 0) {
     const recent = observations.slice(0, 5);
     lines.push(``);
     lines.push(`## Ultimas 5 acciones`);
-    lines.push(``);
-    lines.push(`| # | Hora | Que hizo |`);
-    lines.push(`|---|------|----------|`);
 
     for (const obs of recent) {
       const num = obs.id ?? '';
@@ -206,28 +213,26 @@ function buildHistoricalContext(project, ctx) {
         const detail = sanitizeXml(truncate(obs.detail, 100));
         accion = `${accion}: ${detail}`;
       }
-      lines.push(`| ${num} | ${hora} | ${accion} |`);
+      lines.push(`- #${num} ${hora} ${accion}`);
     }
   }
 
-  // --- Top 10 por relevancia ---
+  // --- Top 7 por relevancia (merged, bullets) ---
   if (topScored && topScored.length > 0) {
     lines.push(``);
-    lines.push(`## Top 10 por relevancia`);
-    lines.push(``);
-    lines.push(`| # | Hora | Que hizo | Score |`);
-    lines.push(`|---|------|----------|-------|`);
+    lines.push(`## Top por relevancia`);
 
-    for (const obs of topScored.slice(0, 10)) {
+    for (const obs of topScored.slice(0, 7)) {
       const num = obs.id ?? '';
       const hora = sanitizeXml(formatHour(obs.created_at));
       const accion = sanitizeXml(truncate(obs.action || '', 80));
       const score = obs.composite_score != null ? Number(obs.composite_score).toFixed(2) : '';
-      lines.push(`| ${num} | ${hora} | ${accion} | ${score} |`);
+      lines.push(`- #${num} ${hora} ${accion} [${score}]`);
     }
   }
 
-  // --- Indice de sesiones recientes ---
+  // --- Indice de sesiones recientes (reduced in compact mode) ---
+  const maxSessions = isCompact ? 1 : 3;
   if (recentSessions && recentSessions.length > 0) {
     lines.push(``);
     lines.push(`## Indice de sesiones recientes`);
@@ -235,7 +240,7 @@ function buildHistoricalContext(project, ctx) {
     lines.push(`| Sesion | Fecha | Obs | Archivos clave |`);
     lines.push(`|--------|-------|-----|----------------|`);
 
-    for (const sess of recentSessions.slice(0, 3)) {
+    for (const sess of recentSessions.slice(0, maxSessions)) {
       const sesId = sanitizeXml(String(sess.session_id || sess.id || '').slice(0, 8));
       const fecha = sanitizeXml(formatRelativeTime(sess.started_at));
       const obsCount = sess.observation_count ?? sess.obs_count ?? '';
@@ -268,6 +273,90 @@ function buildHistoricalContext(project, ctx) {
   return lines.join('\n');
 }
 
+const LAST_500KB = 500 * 1024;
+
+/**
+ * Find the most recent transcript JSONL that is NOT the current session.
+ * Searches ~/.claude/projects/ for .jsonl files.
+ */
+function findPreviousTranscript(currentSessionId) {
+  try {
+    const claudeDir = join(homedir(), '.claude', 'projects');
+    let best = null;
+    let bestMtime = 0;
+
+    // Walk one level of project dirs
+    for (const projDir of readdirSync(claudeDir, { withFileTypes: true })) {
+      if (!projDir.isDirectory()) continue;
+      const projPath = join(claudeDir, projDir.name);
+      try {
+        for (const file of readdirSync(projPath)) {
+          if (!file.endsWith('.jsonl')) continue;
+          const sessionId = file.replace('.jsonl', '');
+          if (sessionId === currentSessionId) continue;
+          const filePath = join(projPath, file);
+          try {
+            const st = statSync(filePath);
+            if (st.mtimeMs > bestMtime) {
+              bestMtime = st.mtimeMs;
+              best = filePath;
+            }
+          } catch { /* skip */ }
+        }
+      } catch { /* skip */ }
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Extract last N thinking blocks from a transcript JSONL file.
+ * Returns array of { thinking_text, response_text } objects.
+ */
+function extractThinkingFromTranscript(transcriptPath, count = 5) {
+  try {
+    let buf;
+    try { buf = readFileSync(transcriptPath); } catch { return []; }
+    const slice = buf.length > LAST_500KB
+      ? buf.slice(buf.length - LAST_500KB).toString('utf8')
+      : buf.toString('utf8');
+
+    const lines = slice.split('\n').filter(l => l.trim());
+    const blocks = [];
+
+    for (const line of lines) {
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (entry.type !== 'assistant') continue;
+
+      const contentArray = entry.message?.content ?? entry.content;
+      if (!Array.isArray(contentArray)) continue;
+
+      let thinking_text = '';
+      let response_text = '';
+
+      for (const block of contentArray) {
+        if (block.type === 'thinking' && (block.thinking || block.text)) {
+          const t = block.thinking || block.text;
+          thinking_text += (thinking_text ? '\n' : '') + t;
+        } else if (block.type === 'text' && block.text) {
+          response_text += (response_text ? '\n' : '') + block.text;
+        }
+      }
+
+      if (thinking_text || response_text) {
+        blocks.push({ thinking_text, response_text });
+      }
+    }
+
+    return blocks.slice(-count);
+  } catch {
+    return [];
+  }
+}
+
 async function main() {
   const input = await readStdin();
 
@@ -294,6 +383,31 @@ async function main() {
   abandonOrphanSessions(cwd, 4);
   ensureSession(sessionId, project, cwd);
 
+  // Fase 2: On compact, capture thinking from previous transcript
+  let compactThinking = [];
+  if (source === 'compact') {
+    try {
+      const prevTranscript = findPreviousTranscript(sessionId);
+      if (prevTranscript) {
+        compactThinking = extractThinkingFromTranscript(prevTranscript, 5);
+        // Save to turn_log for persistence
+        const nCwd = normalizeCwd(cwd);
+        for (let i = 0; i < compactThinking.length; i++) {
+          try {
+            insertTurnLog(sessionId, cwd, {
+              turn_number: i + 1,
+              thinking_text: compactThinking[i].thinking_text ? redact(compactThinking[i].thinking_text) : '',
+              response_text: compactThinking[i].response_text ? redact(compactThinking[i].response_text) : ''
+            });
+          } catch { /* best-effort */ }
+        }
+        process.stderr.write(`[local-mem] compact: captured ${compactThinking.length} thinking blocks from previous transcript\n`);
+      }
+    } catch (err) {
+      process.stderr.write(`[local-mem] compact thinking capture error: ${err.message}\n`);
+    }
+  }
+
   const ctx = getRecentContext(cwd);
   const { observations, summary, snapshot } = ctx;
 
@@ -301,7 +415,18 @@ async function main() {
   if (observations.length === 0 && !summary && !snapshot) {
     markdown = buildWelcomeContext();
   } else {
-    markdown = buildHistoricalContext(project, ctx);
+    markdown = buildHistoricalContext(project, ctx, source);
+  }
+
+  // Fase 2.3: Inject fresh compact thinking blocks if DB didn't have them yet
+  if (source === 'compact' && compactThinking.length > 0 && ctx.thinking && ctx.thinking.length === 0) {
+    const thinkingLines = ['\n## Razonamiento pre-compact (capturado del transcript)'];
+    for (const t of compactThinking) {
+      if (t.thinking_text) {
+        thinkingLines.push(`- ${sanitizeXml(truncate(t.thinking_text, 500))}`);
+      }
+    }
+    markdown = markdown.replace('</local-mem-data>', thinkingLines.join('\n') + '\n</local-mem-data>');
   }
 
   const update = await updatePromise;
