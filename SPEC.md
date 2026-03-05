@@ -1,6 +1,6 @@
 # SPEC: local-mem — Memoria persistente local para Claude Code
 
-**Version**: 0.6.2
+**Version**: 0.6.3
 **Fecha**: 2026-03-04
 **Status**: Draft
 
@@ -80,6 +80,30 @@
 1. Thinking solo al cierre: si sesion crashea, thinking se pierde. Mitigation: auto-snapshots preservan estado
 2. Scoring estatico: no adapta pesos segun tipo de sesion. Planificado context-dependent scoring para v0.7
 3. Transcript size cap: 200KB puede no cubrir sesiones 4h+. Evaluar en uso real
+
+### [0.6.3] — 2026-03-05
+#### Fixes post re-evaluacion ronda 4 (2 reviewers deep con Rol Research V2.1 --all)
+
+##### SQL performance
+- FIX: `getTopScoredObservations()` — RECENCY_SQL se evaluaba 3 veces por row (SELECT, WHERE, ORDER BY). Ahora usa CTE (`WITH scored AS`) para computar 1 sola vez
+- FIX: `getRecentContext()` topScored — mismo fix con CTE para RECENCY_SQL
+
+##### Session summaries duplicacion
+- FIX: `completeSession()` — INSERT en `session_summaries` podia fallar con UNIQUE constraint (migration v3) si SessionEnd se dispara 2 veces. Ahora usa `ON CONFLICT(session_id) DO UPDATE SET ...`
+
+##### Sincronizacion session-start ↔ server
+- FIX: `session-start.mjs` welcome — no listaba `thinking_search, top_priority` en tools disponibles
+- FIX: `buildHistoricalContext()` — no mostraba `blocking_issues` del snapshot (server.mjs si lo hacia)
+- FIX: `formatContextMarkdown()` tabla sesiones — faltaba columna "Archivos clave" (session-start la tenia)
+- FIX: `formatTime()` en server.mjs — usaba `toLocaleTimeString()` con hour12. Ahora usa formato 24h manual consistente con session-start
+
+##### Cleanup de codigo
+- FIX: `observation.mjs` — `computeScore()` recibia `createdAt` como 3er arg muerto (param eliminado)
+- FIX: `session-start.mjs` — `sess.created_at || sess.started_at` → `sess.started_at` directo (created_at no existe en sessions)
+- FIX: `executeTool()` default case — retornaba shape invalida `{ error: {...} }`. Ahora usa `toolError()`
+- FIX: `formatFiles()` en server.mjs — funcion muerta eliminada
+- FIX: `install.mjs` — numeracion duplicada (paso 7 dos veces → 7 y 8)
+- CHANGE: `serverInfo.version` actualizado a `0.6.3`
 
 ### [0.6.2] — 2026-03-04
 #### Fixes post re-evaluacion (2 reviewers deep con Rol Research V2.1 --all, ronda 2)

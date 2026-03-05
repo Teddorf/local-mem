@@ -363,6 +363,15 @@ export function completeSession(sessionId, summaryData) {
           (session_id, project, cwd, summary_text, tools_used, files_read,
            files_modified, observation_count, prompt_count, duration_seconds, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(session_id) DO UPDATE SET
+          summary_text = excluded.summary_text,
+          tools_used = excluded.tools_used,
+          files_read = excluded.files_read,
+          files_modified = excluded.files_modified,
+          observation_count = excluded.observation_count,
+          prompt_count = excluded.prompt_count,
+          duration_seconds = excluded.duration_seconds,
+          created_at = excluded.created_at
       `).run(
         sessionId,
         sd.project || '',
@@ -514,12 +523,16 @@ export function getTopScoredObservations(cwd, opts = {}) {
   const limit = opts.limit || 15;
   try {
     return db.prepare(`
-      SELECT o.id, o.tool_name, o.action, o.detail,
-             ${RECENCY_SQL} AS composite_score, o.created_at
-      FROM observation_scores s
-      JOIN observations o ON o.id = s.observation_id
-      WHERE o.cwd = ? AND ${RECENCY_SQL} >= ?
-      ORDER BY ${RECENCY_SQL} DESC
+      WITH scored AS (
+        SELECT o.id, o.tool_name, o.action, o.detail,
+               ${RECENCY_SQL} AS composite_score, o.created_at
+        FROM observation_scores s
+        JOIN observations o ON o.id = s.observation_id
+        WHERE o.cwd = ?
+      )
+      SELECT * FROM scored
+      WHERE composite_score >= ?
+      ORDER BY composite_score DESC
       LIMIT ?
     `).all(nCwd, minScore, limit);
   } finally {
@@ -588,12 +601,15 @@ export function getRecentContext(cwd, opts = {}) {
 
     // v0.6: top observaciones por score con threshold dinamico (recency at query-time)
     const allScored = db.prepare(`
-      SELECT o.id, o.tool_name, o.action, o.created_at,
-             ${RECENCY_SQL} AS composite_score
-      FROM observation_scores s
-      JOIN observations o ON o.id = s.observation_id
-      WHERE o.cwd = ?
-      ORDER BY ${RECENCY_SQL} DESC
+      WITH scored AS (
+        SELECT o.id, o.tool_name, o.action, o.created_at,
+               ${RECENCY_SQL} AS composite_score
+        FROM observation_scores s
+        JOIN observations o ON o.id = s.observation_id
+        WHERE o.cwd = ?
+      )
+      SELECT * FROM scored
+      ORDER BY composite_score DESC
       LIMIT 30
     `).all(nCwd);
     const threshold = getThreshold(allScored.map(r => r.composite_score));

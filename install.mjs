@@ -239,7 +239,7 @@ async function main() {
     console.log(`  [OK] Hooks agregados: ${addedHooks.join(', ')}`);
   }
 
-  // 7. Register MCP via claude mcp add
+  // 8. Register MCP via claude mcp add
   console.log('\nRegistrando MCP server...');
   const mcpResult = registerMcp();
   let mcpFallbackUsed = false;

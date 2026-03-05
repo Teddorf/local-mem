@@ -419,14 +419,30 @@ function formatContextMarkdown(ctx) {
     lines.push('');
     lines.push('## Indice de sesiones recientes');
     lines.push('');
-    lines.push('| Sesion | Fecha | Obs |');
-    lines.push('|--------|-------|-----|');
+    lines.push('| Sesion | Fecha | Obs | Archivos clave |');
+    lines.push('|--------|-------|-----|----------------|');
 
     for (const sess of recentSessions.slice(0, 3)) {
       const sesId = sanitizeXml(String(sess.session_id || '').slice(0, 8));
       const age = sess.started_at ? formatAge(sess.started_at) : '?';
       const obsCount = sess.observation_count ?? '';
-      lines.push(`| ${sesId} | hace ${age} | ${obsCount} |`);
+      let keyFiles = '';
+      if (sess.files_modified || sess.files_read) {
+        const sf = [];
+        for (const field of ['files_modified', 'files_read']) {
+          if (sess[field]) {
+            try {
+              const files = typeof sess[field] === 'string' ? JSON.parse(sess[field]) : sess[field];
+              if (Array.isArray(files)) sf.push(...files);
+            } catch {}
+          }
+        }
+        if (sf.length > 0) {
+          keyFiles = sf.slice(0, 2).map(f => sanitizeXml(String(f))).join(', ');
+          if (sf.length > 2) keyFiles += ` +${sf.length - 2}`;
+        }
+      }
+      lines.push(`| ${sesId} | hace ${age} | ${obsCount} | ${keyFiles} |`);
     }
   }
 
@@ -446,20 +462,9 @@ function formatAge(epoch) {
 
 function formatTime(epoch) {
   const d = new Date(epoch * 1000);
-  return d.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', hour12: true });
-}
-
-function formatFiles(filesStr) {
-  try {
-    const files = typeof filesStr === 'string' ? JSON.parse(filesStr) : filesStr;
-    if (Array.isArray(files) && files.length) {
-      return files.map(f => sanitizeXml(String(f))).join(', ');
-    }
-    if (typeof files === 'string') return sanitizeXml(files);
-  } catch {
-    return sanitizeXml(String(filesStr));
-  }
-  return '';
+  const h = d.getHours().toString().padStart(2, '0');
+  const m = d.getMinutes().toString().padStart(2, '0');
+  return `${h}:${m}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -651,7 +656,7 @@ async function executeTool(name, params) {
     }
 
     default:
-      return { error: { code: -32601, message: `Unknown tool: ${name}` } };
+      return toolError(`Unknown tool: ${name}`);
   }
 }
 
@@ -687,7 +692,7 @@ async function handleMessage(msg) {
         jsonrpcResult(id, {
           protocolVersion: '2025-03-26',
           capabilities: { tools: {} },
-          serverInfo: { name: 'local-mem', version: '0.6.2' },
+          serverInfo: { name: 'local-mem', version: '0.6.3' },
         })
       );
       break;

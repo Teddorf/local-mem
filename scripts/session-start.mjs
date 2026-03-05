@@ -54,7 +54,7 @@ function buildWelcomeContext() {
 local-mem esta activo. Esta es tu primera sesion en este proyecto.
 Cuando termines, tu progreso se guardara automaticamente.
 En la proxima sesion, veras aqui un resumen de lo que hiciste.
-Tools disponibles via MCP: search, save_state, context, forget, status, recent
+Tools disponibles via MCP: search, save_state, context, forget, status, recent, thinking_search, top_priority
 </local-mem-data>`;
 }
 
@@ -156,6 +156,19 @@ function buildHistoricalContext(project, ctx) {
         }
       } catch {}
     }
+
+    if (snapshot.blocking_issues) {
+      try {
+        const issues = typeof snapshot.blocking_issues === 'string'
+          ? JSON.parse(snapshot.blocking_issues)
+          : snapshot.blocking_issues;
+        if (Array.isArray(issues) && issues.length > 0) {
+          lines.push(`- Bloqueantes: ${issues.map(i => sanitizeXml(String(i))).join(', ')}`);
+        } else if (typeof issues === 'string' && issues) {
+          lines.push(`- Bloqueantes: ${sanitizeXml(issues)}`);
+        }
+      } catch {}
+    }
   }
 
   // --- Ultimo razonamiento de Claude ---
@@ -224,7 +237,7 @@ function buildHistoricalContext(project, ctx) {
 
     for (const sess of recentSessions.slice(0, 3)) {
       const sesId = sanitizeXml(String(sess.session_id || sess.id || '').slice(0, 8));
-      const fecha = sanitizeXml(formatRelativeTime(sess.created_at || sess.started_at));
+      const fecha = sanitizeXml(formatRelativeTime(sess.started_at));
       const obsCount = sess.observation_count ?? sess.obs_count ?? '';
       // Extract key files from session if available
       let keyFiles = '';

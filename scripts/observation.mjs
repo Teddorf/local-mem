@@ -220,8 +220,7 @@ try {
 
   // Priority scoring
   try {
-    const createdAt = Math.floor(Date.now() / 1000);
-    const score = computeScore(tool_name, action, createdAt);
+    const score = computeScore(tool_name, action);
     insertObservationScore(Number(result.lastInsertRowid), score);
   } catch (e) {
     process.stderr.write(`[local-mem] Score error: ${e.message}\n`);
