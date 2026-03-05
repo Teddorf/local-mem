@@ -222,7 +222,7 @@ function buildHistoricalContext(project, ctx) {
       const num = obs.id ?? '';
       const hora = sanitizeXml(formatHour(obs.created_at));
       const accion = sanitizeXml(truncate(obs.action || '', 80));
-      const score = obs.composite_score != null ? String(obs.composite_score) : '';
+      const score = obs.composite_score != null ? Number(obs.composite_score).toFixed(2) : '';
       lines.push(`| ${num} | ${hora} | ${accion} | ${score} |`);
     }
   }

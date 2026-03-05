@@ -409,7 +409,7 @@ function formatContextMarkdown(ctx) {
     for (const obs of topScored.slice(0, 10)) {
       const time = obs.created_at ? formatTime(obs.created_at) : '?';
       const action = sanitizeXml(truncate(obs.action || '', 80));
-      const score = obs.composite_score != null ? String(obs.composite_score) : '';
+      const score = obs.composite_score != null ? Number(obs.composite_score).toFixed(2) : '';
       lines.push(`| ${obs.id} | ${time} | ${action} | ${score} |`);
     }
   }
@@ -692,7 +692,7 @@ async function handleMessage(msg) {
         jsonrpcResult(id, {
           protocolVersion: '2025-03-26',
           capabilities: { tools: {} },
-          serverInfo: { name: 'local-mem', version: '0.6.3' },
+          serverInfo: { name: 'local-mem', version: '0.6.4' },
         })
       );
       break;

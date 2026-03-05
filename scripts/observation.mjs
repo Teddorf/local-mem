@@ -26,6 +26,11 @@ function extractResponseText(tool_response) {
   if (typeof tool_response === 'object') {
     // Claude Code tool_response is often { output: '...', error: '...', exitCode: N }
     if (tool_response.output != null) return String(tool_response.output);
+    if (Array.isArray(tool_response.content)) {
+      const textPart = tool_response.content.find(p => p && p.type === 'text');
+      if (textPart) return textPart.text;
+      return JSON.stringify(tool_response.content);
+    }
     if (tool_response.content != null) return String(tool_response.content);
     if (tool_response.text != null) return String(tool_response.text);
     // Fallback: stringify

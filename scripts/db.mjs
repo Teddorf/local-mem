@@ -765,9 +765,9 @@ export function getSessionDetail(sessionId, cwd) {
 
     const observations = db.prepare(`
       SELECT id, tool_name, action, files, detail, cwd, created_at
-      FROM observations WHERE session_id = ? AND cwd = ?
+      FROM observations WHERE session_id = ?
       ORDER BY created_at ASC
-    `).all(sid, nCwd);
+    `).all(sid);
 
     const prompts = db.prepare(`
       SELECT id, prompt_text, created_at

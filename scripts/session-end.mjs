@@ -178,6 +178,15 @@ try {
   const nCwd = normalizeCwd(cwd || '');
   const project = nCwd ? basename(nCwd) : '';
 
+  const obsCount = stats ? stats.observation_count : 0;
+  const promptCount = stats ? stats.prompt_count : 0;
+
+  // Skip completing sessions with zero activity (ghost sessions)
+  if (obsCount === 0 && promptCount === 0) {
+    process.stdout.write('Success\n');
+    process.exit(0);
+  }
+
   completeSession(session_id, {
     cwd: nCwd,
     project,
@@ -185,8 +194,8 @@ try {
     tools_used,
     files_read,
     files_modified,
-    observation_count: stats ? stats.observation_count : 0,
-    prompt_count: stats ? stats.prompt_count : 0,
+    observation_count: obsCount,
+    prompt_count: promptCount,
     duration_seconds: durationSeconds
   });
 

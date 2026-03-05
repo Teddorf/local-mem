@@ -1,7 +1,7 @@
 # SPEC: local-mem — Memoria persistente local para Claude Code
 
-**Version**: 0.6.3
-**Fecha**: 2026-03-04
+**Version**: 0.6.4
+**Fecha**: 2026-03-05
 **Status**: Draft
 
 ---
@@ -80,6 +80,21 @@
 1. Thinking solo al cierre: si sesion crashea, thinking se pierde. Mitigation: auto-snapshots preservan estado
 2. Scoring estatico: no adapta pesos segun tipo de sesion. Planificado context-dependent scoring para v0.7
 3. Transcript size cap: 200KB puede no cubrir sesiones 4h+. Evaluar en uso real
+
+### [0.6.4] — 2026-03-05
+#### Fixes post smoke test de integracion (12 tools, 4 hooks, ciclo completo)
+
+##### Score display
+- FIX: `session-start.mjs` y `server.mjs` — composite_score mostraba float largo (ej: `0.7999999999999999`). Ahora usa `.toFixed(2)` → `0.80`
+
+##### Agent detail [object Object]
+- FIX: `observation.mjs` `extractResponseText()` — si `tool_response.content` es un array MCP (`[{type:"text", text:"..."}]`), `String(array)` producia `[object Object]`. Ahora detecta arrays, extrae el primer `type:"text"` part, fallback a `JSON.stringify`
+
+##### Ghost sessions
+- FIX: `session-end.mjs` — sesiones con 0 observaciones y 0 prompts (ghost sessions) ya no generan summary vacio. SessionEnd hace early return si no hubo actividad. Reduce ruido en session index y export
+
+##### session_detail observations vacias
+- FIX: `db.mjs` `getSessionDetail()` — observations query filtraba por `session_id AND cwd`. Si el usuario hace CD durante la sesion, las obs se graban con el nuevo cwd mientras la sesion conserva el cwd original, resultando en 0 results. Ahora filtra solo por `session_id` (suficiente ya que session_id es unico y la sesion ya fue validada por cwd)
 
 ### [0.6.3] — 2026-03-05
 #### Fixes post re-evaluacion ronda 4 (2 reviewers deep con Rol Research V2.1 --all)
