@@ -5,6 +5,73 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - Planned
+
+### Added
+- **Progressive Disclosure**: 3 levels of context injection adapted to the event source
+  - Level 1 (Index Card, ~150 tok): on `/clear` — summary 1-liner + task/step + 1 prompt
+  - Level 2 (Full Startup, ~1000 tok): on new session — full summary + cross-session curated + thinking + actions + top scored
+  - Level 3 (Full Recovery, ~1400 tok): on compact/resume — everything + 5 thinking blocks + 10 actions + top 10 + transcript thinking
+- **Cross-session curated context**: structured data from previous session injected on startup — pending work, open decisions, blockers, high-impact actions (Edit/Write/Bash by score), last reasoning, last user request
+- `queryCuratedPrevSession()` — single CTE query joining sessions + execution_snapshots + user_prompts + turn_log
+- `queryPrevHighImpactActions()` — top 5 Edit/Write/Bash observations from previous session by composite_score
+- `getDisclosureLevel(source)` — selects level 1/2/3 based on source event (no heuristics)
+- `getRecentContext()` accepts `opts.level` for conditional queries per level
+- `buildHistoricalContext()` receives `level` for conditional rendering
+- Compact thinking capture from transcript (Phase 2)
+- Auto-snapshot extracts plan/execution from thinking (Phase 3)
+
+### Changed
+- Thinking query LIMIT 1 → LIMIT 5 in `getRecentContext()`
+- `buildHistoricalContext()` renders 5 thinking blocks (500 chars each)
+- `insertTurnLog()` truncation: thinking 2KB→4KB, response 1KB→2KB
+- Prompts: 3→5, truncation 80→120 chars
+- Table format → compact bullets (-30% tokens)
+- Actions: 5 in level 2, 10 in level 3
+- Top scored: 7 in level 2, 10 in level 3
+
+### Fixed
+- SessionEnd timeout settings.json 15s → 20s
+
+## [0.6.4] - 2026-03-05
+
+### Fixed
+- Score display: `composite_score` showed raw float (e.g., `0.7999999999999999`), now uses `.toFixed(2)` in `session-start.mjs` and `server.mjs`
+- Agent detail `[object Object]`: `extractResponseText()` in `observation.mjs` now handles MCP arrays (`[{type:"text", text:"..."}]`)
+- Ghost sessions: `session-end.mjs` early returns if 0 observations + 0 prompts
+- `session_detail` empty observations: `db.mjs` filtered by `session_id AND cwd` but CD changes cwd mid-session; now filters only by `session_id`
+- Thinking capture: `block.thinking` vs `block.text` key mismatch in transcript parsing
+- Thinking capture: 200KB cap → 20MB for complete coverage on long sessions (9MB+)
+
+## [0.6.3] - 2026-03-05
+
+### Fixed
+- SQL performance: `RECENCY_SQL` evaluated 3 times per row; now uses CTE (`WITH scored AS`)
+- Session summaries duplication: `INSERT` with `ON CONFLICT(session_id) DO UPDATE SET`
+- Sync session-start ↔ server: missing `thinking_search, top_priority` in tools list, missing `blocking_issues` from snapshot, missing "Archivos clave" column
+- `formatTime()` inconsistency: now uses 24h format consistently
+- Dead code cleanup: `computeScore()` dead arg, `created_at` fallback, `formatFiles()` dead function, install.mjs duplicate step numbering
+
+## [0.6.2] - 2026-03-04
+
+### Fixed
+- Query-time recency: `computeScore()` now calculates base_score WITHOUT recency; `RECENCY_SQL` applies recency band at query time
+
+## [0.6.0] - 2026-03-04
+
+### Added
+- Rich detail capture: `distill()` receives `tool_response` as 3rd param, extracts useful detail per tool type (Bash: exit code + output, Grep: matches, WebSearch: titles + URLs, etc.)
+- Thinking capture in SessionEnd: parses full transcript for thinking blocks, stores in `turn_log` table
+- Auto-snapshots: every 25 observations, captures last 10 actions + last 3 prompts, retains only last 3 per session
+- Priority scoring: `composite_score = 0.4*impact + 0.3*recency_band + 0.2*error_flag + 0.1*tool_weight` with dynamic threshold
+- Curated context with index: redesigned `buildHistoricalContext()` with sections for thinking, prompts, top scored, session index
+- Schema migration v1 → v2: `turn_log` + FTS5, `observation_scores`, `execution_snapshots` additions
+- MCP tools: `thinking_search`, `top_priority`
+- Extended cleanup: `turn_log` and `observation_scores` retention
+
+### Changed
+- Token budget ≤ 800 tokens for injected context (reduced from ~2500)
+
 ## [0.1.0] - 2026-03-04
 
 ### Added

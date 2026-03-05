@@ -84,31 +84,93 @@
 ### [0.6.4] — 2026-03-05
 
 ### [0.7.0] — 2026-03-05 (planned)
-#### Continuidad perfecta post-compact
+#### Continuidad perfecta post-compact + Progressive Disclosure
 
-**Root cause**: Al compactar, Claude pierde plan, decisiones, razonamiento y punto de ejecucion. local-mem captura QUE hizo (tools) pero no QUE PENSO. No existe hook PreCompact.
+**Root cause**: Al compactar, Claude pierde plan, decisiones, razonamiento y punto de ejecucion. local-mem captura QUE hizo (tools) pero no QUE PENSO. No existe hook PreCompact. Ademas, el contexto inyectado es identico sin importar si es startup, compact o clear — desperdicia tokens o pierde informacion segun el caso.
 
-**Analisis**: 4 agentes (Datos, Hooks, Token Budget, Thinking) auditaron el sistema. Convergencia: transcript append en tiempo real, 5 thinking blocks suficientes, budget 1200 compact / 800 new session, bullets -30% tokens.
+**Principio**: Contexto perdido = bugs + tokens desperdiciados. Siempre es mejor inyectar 200 tokens de mas que perder una frase que resulta en algo no implementado.
 
-##### Fase 1 — Quick wins
+**Analisis**: 4 agentes (Datos, Hooks, Token Budget, Thinking) auditaron el sistema. Convergencia: transcript append en tiempo real, 5 thinking blocks suficientes, budget adaptativo por nivel. Analisis adicional: Gap 1 (Progressive Disclosure) de sesion f9cfc923.
+
+##### Progressive Disclosure — 3 niveles de contexto
+
+Seleccion por `source` (sin heuristicas):
+```
+source === 'clear'              -> Nivel 1 (Index Card, ~150 tok)
+source === 'startup' (default)  -> Nivel 2 (Full Startup, ~800-1000 tok)
+source === 'compact' | 'resume' -> Nivel 3 (Full Recovery, ~1200-1500 tok)
+```
+
+**Nivel 1 — Index Card (~150 tokens)**
+- Trigger: `source === "clear"`
+- Contenido: resumen 1-liner (150 chars) + snapshot (tarea + paso) + 1 prompt
+- Queries: summary LIMIT 1 + snapshot LIMIT 1 + prompt LIMIT 1
+
+**Nivel 2 — Full Startup (~800-1000 tokens)**
+- Trigger: `source === "startup"` (default)
+- Contenido: resumen completo (tools, archivos, resultado) + snapshot completo + 3 thinking blocks + 5 prompts + 5 acciones con detail + top 7 por relevancia + 3 sesiones recientes + **cross-session curada**
+- Cross-session curada: datos estructurados de la sesion anterior (pendiente, decisiones sin resolver, bloqueantes, top 5 acciones de impacto Edit/Write/Bash, ultimo razonamiento, ultimo pedido)
+
+**Nivel 3 — Full Recovery (~1200-1500 tokens)**
+- Trigger: `source === "compact"` o `source === "resume"`
+- Contenido: todo de nivel 2 PLUS: 5 thinking blocks + 10 acciones + top 10 por relevancia + razonamiento pre-compact del transcript + **cross-session curada** (siempre, sin importar cantidad de obs)
+- Diferencia clave: nivel 2 mira ATRAS (sesiones anteriores), nivel 3 mira la sesion ACTUAL en profundidad
+
+Comparacion de secciones por nivel:
+
+| Seccion | Nivel 1 | Nivel 2 | Nivel 3 |
+|---------|---------|---------|---------|
+| Resumen | 1-liner | full | full |
+| Cross-session curada | - | si | si |
+| Snapshot | tarea+paso | full | full |
+| Thinking | - | 3 blocks | 5 blocks |
+| Prompts | 1 | 5 | 5 |
+| Acciones | - | 5 | 10 |
+| Top relevancia | - | 7 | 10 |
+| Sesiones index | - | 3 | 1 |
+
+##### Cross-session curada (nuevo)
+
+No es un dump de `summary_text`. Es data estructurada de 5 tablas, ordenada por accionabilidad:
+
+1. **Pendiente** (`next_action` de snapshot anterior) — que hay que hacer
+2. **Decisiones sin resolver** (`open_decisions`) — que hay que decidir
+3. **Bloqueantes** (`blocking_issues`) — que puede frenar
+4. **Acciones de impacto** (top 5 Edit/Write/Bash por score de sesion anterior) — que se toco
+5. **Ultimo razonamiento** (`last_thinking` de `turn_log`) — plan mental al cerrar
+6. **Ultimo pedido** (`last_prompt` de `user_prompts`) — intencion del usuario
+
+- ADD: `queryCuratedPrevSession(db, nCwd)` — CTE con JOIN a sessions + execution_snapshots + subqueries a user_prompts y turn_log (1 query)
+- ADD: `queryPrevHighImpactActions(db, nCwd)` — top 5 observations Edit/Write/Bash de sesion anterior por composite_score
+- ADD: `renderCrossSession(lines, prevSession, prevActions)` — renderer con orden de accionabilidad
+- NOTA: cross-session se ejecuta siempre en nivel 2+, sin condicion de cantidad de obs. Contexto perdido = bugs.
+
+##### Fase 1 — Quick wins + nivel basico
 - CHANGE: thinking query LIMIT 1 -> LIMIT 5 en getRecentContext()
 - CHANGE: buildHistoricalContext() renderiza 5 thinking blocks (500 chars c/u)
 - CHANGE: insertTurnLog() truncado thinking 2KB->4KB, response 1KB->2KB
-- ADD: buildHistoricalContext() diferencia compact (1200 tok) vs startup (800 tok)
+- ADD: `getDisclosureLevel(source)` en session-start.mjs — retorna 1, 2 o 3
+- ADD: `getRecentContext()` acepta `opts.level` — queries condicionales por nivel
+- ADD: `buildHistoricalContext()` recibe `level` — render condicional por nivel
 - CHANGE: Formato tablas -> bullets compactos (-30% tokens)
-- CHANGE: Prompts 80->120 chars. Merge acciones+top10 -> Top 7 por score
+- CHANGE: Prompts 3->5, truncado 80->120 chars
+- CHANGE: Acciones: 5 en nivel 2, 10 en nivel 3
 
 ##### Fase 2 — Captura en compact event
 - ADD: SessionStart(compact) descubre transcript via glob session_id.jsonl
 - ADD: Lee ultimos 500KB, extrae 5 thinking + ultimo response -> turn_log
 - ADD: Inyecta en additionalContext inmediatamente
 
-##### Fase 3 — Auto-save_state inteligente
+##### Fase 3 — Auto-save_state inteligente + cross-session
 - CHANGE: Auto-snapshot extrae plan/ejecucion del thinking (no generico)
 - ADD: Auto-snapshot captura archivos activos de ultimas 25 obs
+- ADD: Cross-session curada (queryCuratedPrevSession + queryPrevHighImpactActions + renderCrossSession)
 
 ##### Fix
 - FIX: SessionEnd timeout settings.json 15s -> 20s
+
+##### Diseno detallado
+- Ver `PROGRESSIVE_DISCLOSURE.md` para queries SQL completas, logica de renderer, y mockups de output por nivel
 
 ### [0.6.4] — 2026-03-05
 #### Fixes post smoke test de integracion (12 tools, 4 hooks, ciclo completo)
@@ -1145,7 +1207,7 @@ if (!validateInput(input, ['session_id', 'cwd'])) {
 7. Si es la primera sesion (0 observaciones previas), muestra mensaje de bienvenida
 8. Si `checkForUpdate()` retorno version nueva, agrega `<local-mem-data type="update-notice">` al contexto
 9. Formatea como markdown hybrid (~600-800 tokens) con delimitadores fuertes (v0.6: formato curado con indice)
-9. Output:
+10. Output:
 ```json
 {
   "hookSpecificOutput": {
@@ -1154,7 +1216,7 @@ if (!validateInput(input, ['session_id', 'cwd'])) {
   }
 }
 ```
-10. Exit code 0
+11. Exit code 0
 
 ### Formato del contexto inyectado (v0.6 — hybrid index, ~600-800 tokens):
 
