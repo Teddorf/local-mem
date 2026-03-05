@@ -8,7 +8,6 @@ import {
   ensureSession,
   getRecentContext,
   insertTurnLog,
-  normalizeCwd,
 } from './db.mjs';
 import { sanitizeXml, truncate, redact } from './redact.mjs';
 
@@ -391,7 +390,6 @@ async function main() {
       if (prevTranscript) {
         compactThinking = extractThinkingFromTranscript(prevTranscript, 5);
         // Save to turn_log for persistence
-        const nCwd = normalizeCwd(cwd);
         for (let i = 0; i < compactThinking.length; i++) {
           try {
             insertTurnLog(sessionId, cwd, {
