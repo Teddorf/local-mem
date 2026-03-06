@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - SessionEnd timeout settings.json 15s → 20s
+- **Cross-platform**: `captureTechnicalState()` uses pure JS instead of `grep`/`tail` (works on Windows cmd/PowerShell without bash in PATH)
+- **Cross-platform**: `uninstall.mjs` shows platform-appropriate delete command (`rm -rf` on Unix, `rmdir /s /q` on Windows)
+- **Cross-platform**: `uninstall.mjs` Unix delete command now quotes path (prevents issues with spaces in HOME)
+- `captureTechnicalState()` only sets `ts_errors` when output contains real tsc patterns (avoids false `0` when tsc unavailable)
+- `captureTechnicalState()` normalizes CRLF → LF in test_summary output (Windows compatibility)
 
 ## [0.6.4] - 2026-03-05
 

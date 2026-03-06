@@ -55,7 +55,11 @@ try {
   console.log('local-mem uninstalled from settings.json.');
   console.log('');
   console.log('Your memory database was NOT deleted.');
-  console.log(`To delete all data: rm -rf ${join(HOME, '.local-mem', 'data')}`);
+  const dataDir = join(HOME, '.local-mem', 'data');
+  const deleteCmd = process.platform === 'win32'
+    ? `rmdir /s /q "${dataDir}"`
+    : `rm -rf "${dataDir}"`;
+  console.log(`To delete all data: ${deleteCmd}`);
   console.log('');
   console.log('Restart Claude Code for changes to take effect.');
 } catch (err) {

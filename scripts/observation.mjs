@@ -173,24 +173,39 @@ function captureTechnicalState(cwd) {
   const state = {};
   const timeout = 10_000;
 
-  // Solo si existe tsconfig.json
+  // Solo si existe tsconfig.json (JS puro, sin grep/tail — cross-platform)
   try {
     if (existsSync(path.join(cwd, 'tsconfig.json'))) {
-      const stdout = execSync('npx tsc --noEmit 2>&1 | grep -c "error TS" || echo 0',
+      const stdout = execSync('npx tsc --noEmit 2>&1',
         { cwd, timeout, encoding: 'utf8' });
-      state.ts_errors = parseInt(stdout.trim()) || 0;
+      state.ts_errors = stdout.split('\n').filter(l => l.includes('error TS')).length;
     }
-  } catch { /* no tsconfig or timeout — skip */ }
+  } catch (e) {
+    // tsc exits non-zero when there are errors — parse stderr/stdout from the error
+    if (e.stdout || e.stderr) {
+      const out = (e.stdout || '') + (e.stderr || '');
+      // Only set ts_errors if output looks like tsc output (not npx/command-not-found errors)
+      if (out.includes('error TS') || out.includes('.ts(') || out.includes('.tsx(')) {
+        state.ts_errors = out.split('\n').filter(l => l.includes('error TS')).length;
+      }
+    }
+  }
 
-  // Solo si existe tests/ o __tests__
+  // Solo si existe tests/ o __tests__ (JS puro, sin tail — cross-platform)
   try {
     const hasTests = existsSync(path.join(cwd, 'tests')) || existsSync(path.join(cwd, '__tests__'));
     if (hasTests) {
-      const stdout = execSync('bun test 2>&1 | tail -3',
+      const stdout = execSync('bun test 2>&1',
         { cwd, timeout, encoding: 'utf8' });
-      state.test_summary = stdout.trim().slice(0, 200);
+      state.test_summary = stdout.replace(/\r/g, '').split('\n').filter(Boolean).slice(-3).join('\n').slice(0, 200);
     }
-  } catch { /* timeout or no tests — skip */ }
+  } catch (e) {
+    // bun test exits non-zero on failures — still capture summary
+    if (e.stdout || e.stderr) {
+      const out = ((e.stdout || '') + (e.stderr || '')).replace(/\r/g, '');
+      state.test_summary = out.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, 200);
+    }
+  }
 
   return Object.keys(state).length > 0 ? JSON.stringify(state) : null;
 }

@@ -1,8 +1,32 @@
 # SPEC: local-mem — Memoria persistente local para Claude Code
 
 **Version**: 0.7.0-planned
-**Fecha**: 2026-03-05
+**Fecha**: 2026-03-06
 **Status**: Draft
+
+---
+
+## Indice
+
+1. [Changelog del SPEC](#changelog-del-spec) — Historial de cambios del diseño por versión
+2. [Componente 1: Base de datos](#componente-1-base-de-datos-scriptsdbmjs) — Schema, migraciones, normalizeCwd, API exportada, FTS5
+3. [Componente 2: Módulo de redacción](#componente-2-modulo-de-redaccion-scriptsredactmjs) — Patrones de secrets, sanitización, tests
+4. [Componente 3: Helper stdin](#componente-3-helper-stdin-scriptsstdinmjs) — Lectura de stdin con timeout y límite
+5. [Componente 4: Hooks](#componente-4-hooks) — Validación stdin, SessionStart, UserPromptSubmit, PostToolUse, SessionEnd
+6. [Componente 5: MCP Server](#componente-5-mcp-server-mcpservermjs) — Lifecycle, protocolo, tools, shutdown, línea buffering
+7. [Componente 6: Instalador](#componente-6-instalador-installmjs) — Merge de hooks, registro MCP, formato settings.json
+8. [Componente 7: Desinstalador](#componente-7-desinstalador-uninstallmjs) — Cleanup limpio, preserva DB
+9. [Componente 8: Health check](#componente-8-health-check-scriptsstatusmjs) — Verificación de estado
+10. [Archivos a crear](#archivos-a-crear-28-total) — Mapa completo del proyecto
+11. [Aislamiento multi-proyecto](#aislamiento-multi-proyecto) — Garantías, reglas, escenarios
+12. [Integración de sistemas](#integracion-de-sistemas) — Flujo end-to-end, inicialización, concurrencia, errores
+13. [Verificación](#verificacion) — Checklist de validación
+14. [Principios de seguridad](#principios-de-seguridad) — 12 principios fundamentales
+15. [Roadmap](#roadmap-futuro-no-incluido-en-v01) — Planes futuros
+16. [Audit QA Post-Implementación](#audit-qa-post-implementacion-v010) — Bugs, falsos positivos, score
+17. [Deuda técnica conocida](#deuda-tecnica-conocida-v01--v06) — Limitaciones actuales
+18. [Plan de implementación v0.6.0](#plan-de-implementacion-v060) — Grafo de dependencias, fases
+19. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
 
 ---
 
@@ -172,15 +196,17 @@ No es un dump de `summary_text`. Es data estructurada de 5 tablas, ordenada por 
 
 ###### 4a. Technical state en auto-snapshot
 - ADD: Al generar auto-snapshot (cada 25 obs), capturar estado tecnico del proyecto:
-  - `ts_errors`: cantidad de errores TypeScript (`npx tsc --noEmit 2>&1 | grep -c 'error TS'`)
-  - `test_summary`: resultado de tests (`bun test 2>&1 | tail -3`)
+  - `ts_errors`: cantidad de errores TypeScript (JS puro, sin dependencias de shell — cuenta lineas con `error TS` en stdout)
+  - `test_summary`: resultado de tests (JS puro — extrae ultimas 3 lineas de stdout)
   - `lint_warnings`: warnings de lint si hay linter configurado
 - ADD: Nuevo campo `technical_state` (JSON) en tabla `execution_snapshots`
 - ADD: Schema migration v3→v4: `ALTER TABLE execution_snapshots ADD COLUMN technical_state TEXT`
 - ADD: Auto-snapshot corre los checks con timeout de 10s (sync, best-effort)
 - ADD: Deteccion automatica: solo corre `tsc` si existe `tsconfig.json`, solo corre `bun test` si existe directorio `tests/` o `__tests__/`
 - RENDER: En cross-session curada: "Estado tecnico al cerrar: 3 TS errors, 1 test fallando" o "Estado tecnico al cerrar: limpio (0 errors, tests OK)"
-- NOTA: Si los comandos fallan o timeout, se omite silenciosamente. No es bloqueante.
+- NOTA: `tsc` y `bun test` salen con exit != 0 cuando hay errores/fallos — el catch parsea stdout/stderr para extraer datos igualmente. Solo se omite si el comando no existe (sin output de tsc real), no tiene output util, o excede el timeout de 10s. No es bloqueante.
+- NOTA: Solo se setea `ts_errors` si el output contiene patrones reales de tsc (`error TS`, `.ts(`, `.tsx(`). Esto evita reportar `ts_errors: 0` cuando npx/tsc no estan disponibles.
+- NOTA: Se aplica `.replace(/\r/g, '')` al output para normalizar line endings en Windows (CRLF → LF).
 
 ###### 4b. Confidence level en save_state
 - ADD: Nuevo parametro opcional `confidence` (integer 1-5) en tool `save_state`
@@ -1656,7 +1682,7 @@ El MCP server abre la DB UNA VEZ al iniciar y la mantiene abierta. Ventajas:
 - `cleanup` permite purgar datos antiguos bajo demanda (minimo 7 dias, preview por defecto). **v0.6**: tambien limpia `turn_log` (retencion 30 dias) y `observation_scores` (via CASCADE)
 - `forget` permite borrar registros especificos (secrets accidentales)
 - El uninstall.mjs NO borra la DB (preserva datos)
-- Para borrar todo: `rm -rf ~/.local-mem/data/`
+- Para borrar todo: Unix `rm -rf ~/.local-mem/data/` | Windows cmd `rmdir /s /q "%USERPROFILE%\.local-mem\data"` | PowerShell `Remove-Item -Recurse -Force "$env:USERPROFILE\.local-mem\data"`
 
 ---
 
@@ -2149,6 +2175,7 @@ Documentada para transparencia:
 5. **Transcript parsing fragil**: El hook SessionEnd extrae el ultimo mensaje de Claude del JSONL, que no siempre contiene un resumen util. Si no lo tiene, `summary_text` queda null (la metadata estructurada siempre se genera).
 6. **Redaccion por regex**: 22 patrones cubren providers principales pero no detecta secrets custom ni codificados en base64/hex. Documentado en ADR-008. Deteccion de entropia planificada para roadmap.
 7. **Permisos Windows**: `chmod` no aplica. ACLs via `icacls` no implementadas. El usuario debe asegurarse manualmente de que `%USERPROFILE%\.local-mem\data\` no este en directorio compartido. Documentado en SECURITY.md.
+7b. **Cross-platform shell commands**: `captureTechnicalState()` usa JS puro para parsear stdout de `tsc` y `bun test` (sin `grep`, `tail`, ni otros comandos Unix). Esto garantiza que funcione en Windows (cmd/PowerShell), Mac y Linux sin depender de que bash este en PATH. El mensaje de `uninstall.mjs` para borrar datos usa el comando apropiado segun la plataforma.
 8. **Forget es hard-delete**: Sin soft-delete ni recovery. Si se borra por error, no hay forma de recuperar. Soft-delete planificado para v0.2.
 9. **MCP server persistent connection no usada directamente**: El module-level `const db = getDb()` sirve como WAL anchor pero cada funcion de db.mjs abre/cierra su propia conexion. Funcional pero no aprovecha la optimizacion de conexion persistente del SPEC. Planificado refactor para v0.2.
 10. **`redactObject()` sin depth limit**: Recursion sin WeakSet. Seguro en el codebase actual (solo recibe JSON parsed) pero fragil ante futuros callers. Agregar WeakSet en v0.2.
