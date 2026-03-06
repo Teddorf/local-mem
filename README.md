@@ -2,7 +2,7 @@
 
 Persistent cross-session memory for Claude Code. 100% open source, 0 external dependencies, fully auditable.
 
-Every tool use, prompt, and session is recorded locally in SQLite. At the start of each new session, Claude automatically receives a summary of recent activity. 10 MCP tools let you search, query, and manage your memory from within Claude Code.
+Every tool use, prompt, and session is recorded locally in SQLite. At the start of each new session, Claude automatically receives a summary of recent activity. 12 MCP tools let you search, query, and manage your memory from within Claude Code.
 
 Works with any Claude model (Opus, Sonnet, Haiku). No AI API calls — everything runs locally with Bun + SQLite.
 
@@ -140,7 +140,7 @@ All 12 tools are available as `mcp__local_mem__<tool_name>` in Claude Code. Clau
 | `export` | Export data as JSON or CSV (max 500 records, paginated) |
 | `forget` | Permanently delete specific records by ID. Use to remove accidentally recorded secrets |
 | `context` | Refresh full project context on-demand. Same output as session start |
-| `save_state` | Save execution snapshot (task, plan, decisions, files). Use before `/compact` |
+| `save_state` | Save execution snapshot (task, plan, decisions, files, confidence 1-5). Use before `/compact` |
 | `get_state` | Retrieve the latest saved execution snapshot |
 | `status` | Health check — DB size, session count, last activity |
 | `thinking_search` | Search through Claude's thinking blocks via FTS5 (turn_log) |
@@ -171,7 +171,7 @@ Output:
 local-mem v0.1.0 — Health Check
 ================================
 DB:            OK (523 KB, ~/.local-mem/data/local-mem.db)
-Schema:        v1
+Schema:        v4
 Sesiones:      12 total (1 active, 11 completed, 0 abandoned)
 Observaciones: 847
 Prompts:       156
@@ -262,7 +262,7 @@ local-mem/
     session-end.mjs                 Hook: generate summary + close session
     status.mjs                      Health check script
   mcp/
-    server.mjs                      MCP server (stdio, long-running) — 10 tools, JSON-RPC 2.0
+    server.mjs                      MCP server (stdio, long-running) — 12 tools, JSON-RPC 2.0
   tests/
     redact.test.mjs                 Required tests for the redaction module
   docs/
@@ -280,7 +280,7 @@ Survives `git clean`. Not inside any project repository. Not synced by default (
 | Guide | Description |
 |-------|-------------|
 | [GETTING_STARTED.md](GETTING_STARTED.md) | Installation, verification, and first test — start here |
-| [USAGE_GUIDE.md](USAGE_GUIDE.md) | Complete reference for all 10 MCP tools, hooks, workflows, and testing |
+| [USAGE_GUIDE.md](USAGE_GUIDE.md) | Complete reference for all 12 MCP tools, hooks, workflows, and testing |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Common errors, diagnostics, FAQ, and maintenance |
 | [SECURITY.md](SECURITY.md) | Security model, secret redaction, attack surface analysis |
 | [SPEC.md](SPEC.md) | Full technical specification (schema, protocols, functions) |

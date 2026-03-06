@@ -176,8 +176,8 @@ No es un dump de `summary_text`. Es data estructurada de 5 tablas, ordenada por 
   - `test_summary`: resultado de tests (`bun test 2>&1 | tail -3`)
   - `lint_warnings`: warnings de lint si hay linter configurado
 - ADD: Nuevo campo `technical_state` (JSON) en tabla `execution_snapshots`
-- ADD: Schema migration v3: `ALTER TABLE execution_snapshots ADD COLUMN technical_state TEXT`
-- ADD: Auto-snapshot corre los checks en background con timeout de 10s (no bloquea el hook)
+- ADD: Schema migration v3→v4: `ALTER TABLE execution_snapshots ADD COLUMN technical_state TEXT`
+- ADD: Auto-snapshot corre los checks con timeout de 10s (sync, best-effort)
 - ADD: Deteccion automatica: solo corre `tsc` si existe `tsconfig.json`, solo corre `bun test` si existe directorio `tests/` o `__tests__/`
 - RENDER: En cross-session curada: "Estado tecnico al cerrar: 3 TS errors, 1 test fallando" o "Estado tecnico al cerrar: limpio (0 errors, tests OK)"
 - NOTA: Si los comandos fallan o timeout, se omite silenciosamente. No es bloqueante.
@@ -185,7 +185,7 @@ No es un dump de `summary_text`. Es data estructurada de 5 tablas, ordenada por 
 ###### 4b. Confidence level en save_state
 - ADD: Nuevo parametro opcional `confidence` (integer 1-5) en tool `save_state`
 - ADD: Nuevo campo `confidence` (INTEGER) en tabla `execution_snapshots`
-- ADD: Schema migration v3: `ALTER TABLE execution_snapshots ADD COLUMN confidence INTEGER`
+- ADD: Schema migration v3→v4: `ALTER TABLE execution_snapshots ADD COLUMN confidence INTEGER`
 - ADD: Claude infiere el nivel del contexto al guardar estado:
   - 1: Explorando, no se si funciona
   - 2: Implementado parcialmente, no testeado
@@ -211,10 +211,10 @@ No es un dump de `summary_text`. Es data estructurada de 5 tablas, ordenada por 
 ##### Fix
 - FIX: SessionEnd timeout settings.json 15s -> 20s
 
-##### Schema migration v2 → v3
+##### Schema migration v3 → v4
 - ADD: `ALTER TABLE execution_snapshots ADD COLUMN technical_state TEXT`
 - ADD: `ALTER TABLE execution_snapshots ADD COLUMN confidence INTEGER`
-- ADD: `schema_version` actualizada a v3
+- ADD: `schema_version` actualizada a v4
 
 ##### Diseno detallado
 - Ver `PROGRESSIVE_DISCLOSURE.md` para queries SQL completas, logica de renderer, y mockups de output por nivel

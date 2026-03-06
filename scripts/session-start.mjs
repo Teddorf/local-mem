@@ -1,7 +1,8 @@
 import { basename } from 'node:path';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { execSync } from 'node:child_process';
 import { readStdin } from './stdin.mjs';
 import {
   abandonOrphanSessions,
@@ -15,6 +16,7 @@ async function checkForUpdate() {
   try {
     const pkg = JSON.parse(readFileSync(import.meta.dirname + '/../package.json', 'utf8'));
     const localVersion = pkg.version;
+    if (!localVersion) return null;
 
     const resp = await fetch(
       'https://raw.githubusercontent.com/Teddorf/local-mem/main/package.json',
@@ -22,7 +24,7 @@ async function checkForUpdate() {
     );
     if (!resp.ok) return null;
     const remote = await resp.json();
-    if (remote.version && remote.version !== localVersion) {
+    if (typeof remote.version === 'string' && remote.version.length < 30 && remote.version !== localVersion) {
       return { local: localVersion, remote: remote.version };
     }
     return null;
@@ -61,17 +63,138 @@ Tools disponibles via MCP: search, save_state, context, forget, status, recent, 
 </local-mem-data>`;
 }
 
-function buildHistoricalContext(project, ctx, source) {
-  const isCompact = source === 'compact';
-  const { observations, summary, snapshot, thinking, topScored, prompts, recentSessions } = ctx;
+function getDisclosureLevel(source) {
+  if (source === 'compact' || source === 'resume') return 3;
+  if (source === 'clear') return 1;
+  return 2; // startup = default
+}
+
+function parseJsonSafe(value) {
+  if (!value) return null;
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+const CONFIDENCE_LABELS = {
+  1: 'explorando, no se si funciona',
+  2: 'implementado parcialmente, no testeado',
+  3: 'implementado, tests pasan pero no revisado',
+  4: 'tests pasan, revisado, falta probar manualmente',
+  5: 'todo OK, listo para merge/deploy'
+};
+
+function renderCrossSession(lines, prevData, prevActions) {
+  if (!prevData) return;
+
+  const relTime = formatRelativeTime(prevData.started_at);
+  lines.push(``);
+  lines.push(`## Sesion anterior (${sanitizeXml(relTime)})`);
+
+  // 1. Que quedo pendiente (lo MAS importante)
+  if (prevData.next_action) {
+    lines.push(`- Pendiente: ${sanitizeXml(truncate(prevData.next_action, 200))}`);
+  }
+
+  // 2. Decisiones abiertas
+  const decisions = parseJsonSafe(prevData.open_decisions);
+  if (Array.isArray(decisions) && decisions.length > 0) {
+    lines.push(`- Decisiones sin resolver: ${decisions.map(d => sanitizeXml(String(d))).join('; ')}`);
+  }
+
+  // 3. Bloqueantes
+  const issues = parseJsonSafe(prevData.blocking_issues);
+  if (Array.isArray(issues) && issues.length > 0) {
+    lines.push(`- Bloqueantes: ${issues.map(i => sanitizeXml(String(i))).join('; ')}`);
+  }
+
+  // 4. Estado tecnico
+  if (prevData.technical_state) {
+    const ts = parseJsonSafe(prevData.technical_state);
+    if (ts) {
+      const parts = [];
+      if (ts.ts_errors !== undefined) parts.push(`${ts.ts_errors} TS errors`);
+      if (ts.test_summary) parts.push(sanitizeXml(ts.test_summary));
+      if (parts.length > 0) {
+        lines.push(`- Estado tecnico al cerrar: ${parts.join(', ')}`);
+      }
+    }
+  }
+
+  // 5. Confianza al cerrar
+  if (prevData.confidence) {
+    lines.push(`- Confianza al cerrar: ${prevData.confidence}/5`);
+  }
+
+  // 6. Acciones de alto impacto
+  if (prevActions && prevActions.length > 0) {
+    const fileSet = new Set();
+    for (const a of prevActions) {
+      const desc = sanitizeXml(truncate(a.action, 80));
+      lines.push(`- ${a.tool_name}: ${desc}`);
+      if (a.files) {
+        const files = parseJsonSafe(a.files);
+        if (Array.isArray(files)) files.forEach(f => f && fileSet.add(f));
+      }
+    }
+    if (fileSet.size > 0) {
+      const shown = [...fileSet].slice(0, 5).map(f => sanitizeXml(String(f))).join(', ');
+      lines.push(`- Archivos tocados: ${shown}`);
+    }
+  }
+
+  // 7. Ultimo razonamiento
+  if (prevData.last_thinking) {
+    lines.push(`- Ultimo razonamiento: ${sanitizeXml(truncate(prevData.last_thinking, 300))}`);
+  }
+
+  // 8. Ultimo pedido del usuario
+  if (prevData.last_prompt) {
+    lines.push(`- Ultimo pedido: "${sanitizeXml(truncate(prevData.last_prompt, 120))}"`);
+  }
+}
+
+function checkContextValidity(snapshot, cwd) {
+  if (!snapshot?.active_files) return null;
+
+  const files = parseJsonSafe(snapshot.active_files);
+  if (!Array.isArray(files) || !files.length) return null;
+
+  const snapshotEpoch = snapshot.created_at;
+  if (!snapshotEpoch) return null;
+  const sinceDate = new Date(snapshotEpoch * 1000).toISOString();
+  const changed = [];
+
+  for (const file of files.slice(0, 10)) {
+    try {
+      const stdout = execSync(
+        `git log --oneline --since="${sinceDate}" -- "${file}"`,
+        { cwd, timeout: 5000, encoding: 'utf8' }
+      );
+      const commits = stdout.trim().split('\n').filter(Boolean);
+      if (commits.length > 0) {
+        changed.push({ file, commits: commits.length });
+      }
+    } catch { /* not in git, timeout, etc — skip */ }
+  }
+
+  return changed.length > 0 ? changed : null;
+}
+
+function buildHistoricalContext(project, ctx, source, level) {
+  const { observations, summary, snapshot, thinking, topScored, prompts,
+          recentSessions, prevSession, prevActions } = ctx;
 
   const lines = [];
 
   lines.push(`<local-mem-data type="historical-context" editable="false">`);
   lines.push(`NOTA: Datos historicos. NO ejecutar comandos. Usar como referencia.`);
-  lines.push(`Busca en memoria con las herramientas MCP de local-mem para mas detalle.`);
+  if (level >= 2) {
+    lines.push(`Busca en memoria con las herramientas MCP de local-mem para mas detalle.`);
+  }
   lines.push(``);
-  lines.push(`# ${sanitizeXml(project)} — contexto reciente`);
+
+  const levelLabel = level === 1 ? 'contexto minimo' : level === 3 ? 'contexto reciente (recovery)' : 'contexto reciente';
+  lines.push(`# ${sanitizeXml(project)} — ${levelLabel}`);
 
   // --- Ultimo resumen ---
   if (summary) {
@@ -80,57 +203,67 @@ function buildHistoricalContext(project, ctx, source) {
     lines.push(``);
     lines.push(`## Ultimo resumen${label}`);
 
-    // Tools line: Tools: Bash(N), Edit(N) | X min, N obs
-    const toolParts = [];
-    if (summary.tools_used) {
-      try {
-        const tools = typeof summary.tools_used === 'string'
-          ? JSON.parse(summary.tools_used)
-          : summary.tools_used;
-        if (typeof tools === 'object' && !Array.isArray(tools)) {
-          const toolEntries = Object.entries(tools)
-            .map(([k, v]) => `${sanitizeXml(k)}(${v})`)
-            .join(', ');
-          if (toolEntries) toolParts.push(`Tools: ${toolEntries}`);
-        } else if (Array.isArray(tools) && tools.length > 0) {
-          toolParts.push(`Tools: ${tools.map(t => sanitizeXml(String(t))).join(', ')}`);
-        }
-      } catch {}
-    }
-    const statParts = [];
-    if (summary.duration_seconds) {
-      const mins = Math.round(summary.duration_seconds / 60);
-      statParts.push(`${mins} min`);
-    }
-    if (summary.observation_count) {
-      statParts.push(`${summary.observation_count} obs`);
-    }
-    const statsStr = statParts.length > 0 ? statParts.join(', ') : '';
-    const toolLine = [toolParts.join(''), statsStr].filter(Boolean).join(' | ');
-    if (toolLine) lines.push(`- ${toolLine}`);
-
-    // Archivos: merge files_modified + files_read, show first few
-    const allFiles = [];
-    for (const field of ['files_modified', 'files_read']) {
-      if (summary[field]) {
+    if (level === 1) {
+      // Solo resultado (1-liner)
+      if (summary.summary_text) {
+        lines.push(`- Resultado: ${sanitizeXml(truncate(summary.summary_text, 150))}`);
+      }
+    } else {
+      // Nivel 2/3: completo (tools, archivos, resultado)
+      const toolParts = [];
+      if (summary.tools_used) {
         try {
-          const files = typeof summary[field] === 'string'
-            ? JSON.parse(summary[field])
-            : summary[field];
-          if (Array.isArray(files)) allFiles.push(...files);
+          const tools = typeof summary.tools_used === 'string'
+            ? JSON.parse(summary.tools_used)
+            : summary.tools_used;
+          if (typeof tools === 'object' && !Array.isArray(tools)) {
+            const toolEntries = Object.entries(tools)
+              .map(([k, v]) => `${sanitizeXml(k)}(${v})`)
+              .join(', ');
+            if (toolEntries) toolParts.push(`Tools: ${toolEntries}`);
+          } else if (Array.isArray(tools) && tools.length > 0) {
+            toolParts.push(`Tools: ${tools.map(t => sanitizeXml(String(t))).join(', ')}`);
+          }
         } catch {}
       }
-    }
-    if (allFiles.length > 0) {
-      const shown = allFiles.slice(0, 3).map(f => sanitizeXml(String(f))).join(', ');
-      const extra = allFiles.length > 3 ? ` (+${allFiles.length - 3} mas)` : '';
-      lines.push(`- Archivos: ${shown}${extra}`);
-    }
+      const statParts = [];
+      if (summary.duration_seconds) {
+        const mins = Math.round(summary.duration_seconds / 60);
+        statParts.push(`${mins} min`);
+      }
+      if (summary.observation_count) {
+        statParts.push(`${summary.observation_count} obs`);
+      }
+      const statsStr = statParts.length > 0 ? statParts.join(', ') : '';
+      const toolLine = [toolParts.join(''), statsStr].filter(Boolean).join(' | ');
+      if (toolLine) lines.push(`- ${toolLine}`);
 
-    if (summary.summary_text) {
-      const text = sanitizeXml(truncate(summary.summary_text, 200));
-      lines.push(`- Resultado: ${text}`);
+      const allFiles = [];
+      for (const field of ['files_modified', 'files_read']) {
+        if (summary[field]) {
+          try {
+            const files = typeof summary[field] === 'string'
+              ? JSON.parse(summary[field])
+              : summary[field];
+            if (Array.isArray(files)) allFiles.push(...files);
+          } catch {}
+        }
+      }
+      if (allFiles.length > 0) {
+        const shown = allFiles.slice(0, 3).map(f => sanitizeXml(String(f))).join(', ');
+        const extra = allFiles.length > 3 ? ` (+${allFiles.length - 3} mas)` : '';
+        lines.push(`- Archivos: ${shown}${extra}`);
+      }
+
+      if (summary.summary_text) {
+        lines.push(`- Resultado: ${sanitizeXml(truncate(summary.summary_text, 200))}`);
+      }
     }
+  }
+
+  // --- Cross-session curada (nivel 2+) ---
+  if (level >= 2) {
+    renderCrossSession(lines, prevSession, prevActions);
   }
 
   // --- Estado guardado ---
@@ -142,43 +275,55 @@ function buildHistoricalContext(project, ctx, source) {
     if (snapshot.current_task) {
       lines.push(`- Tarea: ${sanitizeXml(snapshot.current_task)}`);
     }
-    if (snapshot.execution_point) {
-      lines.push(`- Paso: ${sanitizeXml(snapshot.execution_point)}`);
-    }
-    if (snapshot.next_action) {
-      lines.push(`- Siguiente: ${sanitizeXml(snapshot.next_action)}`);
-    }
-    if (snapshot.open_decisions) {
-      try {
-        const decisions = typeof snapshot.open_decisions === 'string'
-          ? JSON.parse(snapshot.open_decisions)
-          : snapshot.open_decisions;
-        if (Array.isArray(decisions) && decisions.length > 0) {
-          lines.push(`- Decisiones abiertas: ${decisions.map(d => sanitizeXml(String(d))).join(', ')}`);
-        } else if (typeof decisions === 'string' && decisions) {
-          lines.push(`- Decisiones abiertas: ${sanitizeXml(decisions)}`);
-        }
-      } catch {}
-    }
 
-    if (snapshot.blocking_issues) {
-      try {
-        const issues = typeof snapshot.blocking_issues === 'string'
-          ? JSON.parse(snapshot.blocking_issues)
-          : snapshot.blocking_issues;
-        if (Array.isArray(issues) && issues.length > 0) {
-          lines.push(`- Bloqueantes: ${issues.map(i => sanitizeXml(String(i))).join(', ')}`);
-        } else if (typeof issues === 'string' && issues) {
-          lines.push(`- Bloqueantes: ${sanitizeXml(issues)}`);
-        }
-      } catch {}
+    if (level >= 2) {
+      // Full snapshot
+      if (snapshot.execution_point) {
+        lines.push(`- Paso: ${sanitizeXml(snapshot.execution_point)}`);
+      }
+      if (snapshot.next_action) {
+        lines.push(`- Siguiente: ${sanitizeXml(snapshot.next_action)}`);
+      }
+      const decisions = parseJsonSafe(snapshot.open_decisions);
+      if (Array.isArray(decisions) && decisions.length > 0) {
+        lines.push(`- Decisiones abiertas: ${decisions.map(d => sanitizeXml(String(d))).join(', ')}`);
+      }
+      const blockers = parseJsonSafe(snapshot.blocking_issues);
+      if (Array.isArray(blockers) && blockers.length > 0) {
+        lines.push(`- Bloqueantes: ${blockers.map(i => sanitizeXml(String(i))).join(', ')}`);
+      }
+      // v0.7: confidence
+      if (snapshot.confidence) {
+        const label = CONFIDENCE_LABELS[snapshot.confidence] || '';
+        lines.push(`- Confianza: ${snapshot.confidence}/5${label ? ` — ${label}` : ''}`);
+      }
+    } else {
+      // Level 1: solo tarea + paso
+      if (snapshot.execution_point) {
+        lines.push(`- Paso: ${sanitizeXml(truncate(snapshot.execution_point, 100))}`);
+      }
     }
   }
 
-  // --- Razonamiento reciente de Claude (hasta 5 bloques) ---
-  if (thinking && thinking.length > 0) {
+  // --- Aviso de contexto (nivel 2+) ---
+  if (level >= 2 && snapshot) {
+    const staleFiles = checkContextValidity(snapshot, source === 'compact' ? process.cwd() : (snapshot.cwd || process.cwd()));
+    if (staleFiles) {
+      lines.push(``);
+      lines.push(`## Aviso de contexto`);
+      const fileList = staleFiles.map(f =>
+        `${sanitizeXml(f.file)} (${f.commits} commit${f.commits > 1 ? 's' : ''})`
+      ).join(', ');
+      lines.push(`- Archivos modificados fuera de Claude Code desde el ultimo snapshot: ${fileList}`);
+      lines.push(`- El contexto puede estar desactualizado — verificar antes de continuar`);
+    }
+  }
+
+  // --- Razonamiento (nivel 2+) ---
+  if (level >= 2 && thinking && thinking.length > 0) {
+    const thinkingLabel = level === 3 ? 'Razonamiento reciente de Claude' : 'Razonamiento de la sesion anterior';
     lines.push(``);
-    lines.push(`## Razonamiento reciente de Claude`);
+    lines.push(`## ${thinkingLabel}`);
     for (const t of thinking) {
       if (t.thinking_text) {
         const hora = sanitizeXml(formatHour(t.created_at));
@@ -190,7 +335,7 @@ function buildHistoricalContext(project, ctx, source) {
   // --- Ultimos pedidos del usuario ---
   if (prompts && prompts.length > 0) {
     lines.push(``);
-    lines.push(`## Ultimos pedidos del usuario`);
+    lines.push(level === 1 ? `## Ultimo pedido` : `## Ultimos pedidos del usuario`);
     for (const p of prompts) {
       const hora = sanitizeXml(formatHour(p.created_at));
       const text = sanitizeXml(truncate(p.prompt_text || '', 120));
@@ -198,13 +343,13 @@ function buildHistoricalContext(project, ctx, source) {
     }
   }
 
-  // --- Ultimas 5 acciones (bullets, compact) ---
-  if (observations && observations.length > 0) {
-    const recent = observations.slice(0, 5);
+  // --- Acciones recientes (nivel 2+) ---
+  if (level >= 2 && observations && observations.length > 0) {
+    const count = level === 3 ? 10 : 5;
     lines.push(``);
-    lines.push(`## Ultimas 5 acciones`);
+    lines.push(`## Ultimas ${Math.min(observations.length, count)} acciones`);
 
-    for (const obs of recent) {
+    for (const obs of observations.slice(0, count)) {
       const num = obs.id ?? '';
       const hora = sanitizeXml(formatHour(obs.created_at));
       let accion = sanitizeXml(truncate(obs.action || '', 100));
@@ -216,12 +361,13 @@ function buildHistoricalContext(project, ctx, source) {
     }
   }
 
-  // --- Top 7 por relevancia (merged, bullets) ---
-  if (topScored && topScored.length > 0) {
+  // --- Top por relevancia (nivel 2+) ---
+  if (level >= 2 && topScored && topScored.length > 0) {
+    const maxTop = level === 3 ? 10 : 7;
     lines.push(``);
     lines.push(`## Top por relevancia`);
 
-    for (const obs of topScored.slice(0, 7)) {
+    for (const obs of topScored.slice(0, maxTop)) {
       const num = obs.id ?? '';
       const hora = sanitizeXml(formatHour(obs.created_at));
       const accion = sanitizeXml(truncate(obs.action || '', 80));
@@ -230,9 +376,9 @@ function buildHistoricalContext(project, ctx, source) {
     }
   }
 
-  // --- Indice de sesiones recientes (reduced in compact mode) ---
-  const maxSessions = isCompact ? 1 : 3;
-  if (recentSessions && recentSessions.length > 0) {
+  // --- Indice de sesiones recientes (nivel 2+) ---
+  const maxSessions = level === 3 ? 1 : 3;
+  if (level >= 2 && recentSessions && recentSessions.length > 0) {
     lines.push(``);
     lines.push(`## Indice de sesiones recientes`);
     lines.push(``);
@@ -243,7 +389,6 @@ function buildHistoricalContext(project, ctx, source) {
       const sesId = sanitizeXml(String(sess.session_id || sess.id || '').slice(0, 8));
       const fecha = sanitizeXml(formatRelativeTime(sess.started_at));
       const obsCount = sess.observation_count ?? sess.obs_count ?? '';
-      // Extract key files from session if available
       let keyFiles = '';
       if (sess.files_modified || sess.files_read) {
         const sf = [];
@@ -406,14 +551,15 @@ async function main() {
     }
   }
 
-  const ctx = getRecentContext(cwd);
+  const level = getDisclosureLevel(source);
+  const ctx = getRecentContext(cwd, { level });
   const { observations, summary, snapshot } = ctx;
 
   let markdown;
   if (observations.length === 0 && !summary && !snapshot) {
     markdown = buildWelcomeContext();
   } else {
-    markdown = buildHistoricalContext(project, ctx, source);
+    markdown = buildHistoricalContext(project, ctx, source, level);
   }
 
   // Fase 2.3: Inject fresh compact thinking blocks if DB didn't have them yet
@@ -429,7 +575,7 @@ async function main() {
 
   const update = await updatePromise;
   if (update) {
-    markdown += `\n<local-mem-data type="update-notice">\nNueva version disponible: v${update.remote} (actual: v${update.local}). Ejecuta: cd ${import.meta.dirname}/.. && git pull\n</local-mem-data>`;
+    markdown += `\n<local-mem-data type="update-notice">\nNueva version disponible: v${sanitizeXml(update.remote)} (actual: v${sanitizeXml(update.local)}). Ejecuta: cd ${import.meta.dirname}/.. && git pull\n</local-mem-data>`;
   }
 
   const output = {

@@ -44,7 +44,7 @@ Sesión termina   →  Genera resumen y cierra la sesión
 
 ### 2. Servidor MCP (bajo demanda)
 
-Un proceso que corre mientras Claude Code está abierto. Expone 10 herramientas que Claude puede usar cuando vos se lo pedís o cuando el contexto lo requiere.
+Un proceso que corre mientras Claude Code está abierto. Expone 12 herramientas que Claude puede usar cuando vos se lo pedís o cuando el contexto lo requiere.
 
 Las herramientas se llaman `mcp__local_mem__<nombre>` internamente, pero no necesitás saber eso — simplemente pedile a Claude lo que necesitás.
 
@@ -148,6 +148,7 @@ Dame el contexto completo del proyecto
 | `open_decisions` | string[] | no | — | Decisiones sin tomar |
 | `active_files` | string[] | no | — | Archivos en los que estás trabajando |
 | `blocking_issues` | string[] | no | — | Problemas que bloquean progreso |
+| `confidence` | integer | no | — | Nivel de confianza 1-5: 1=explorando, 2=parcial, 3=tests pasan, 4=revisado, 5=listo para ship |
 
 **Cómo pedirlo:**
 
@@ -208,7 +209,7 @@ Verificá que local-mem esté funcionando bien
 **Qué devuelve:**
 ```
 DB:           OK (228 KB, ~/.local-mem/data/local-mem.db)
-Schema:       v1
+Schema:       v4
 Sesiones:     5 total (1 active, 4 completed, 0 abandoned)
 Observaciones: 847
 Prompts:      156

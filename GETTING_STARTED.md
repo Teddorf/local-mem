@@ -52,7 +52,7 @@ Deberías ver algo así:
 local-mem v0.1.0 — Health Check
 ================================
 DB:           OK (12 KB, ~/.local-mem/data/local-mem.db)
-Schema:       v1
+Schema:       v4
 Sesiones:     0 total (0 active, 0 completed, 0 abandoned)
 Observaciones: 0
 Prompts:      0
@@ -195,7 +195,7 @@ No tenés que hacer nada especial. local-mem trabaja en segundo plano.
 
 ---
 
-## Qué podés hacer manualmente (10 herramientas MCP)
+## Qué podés hacer manualmente (12 herramientas MCP)
 
 Estas herramientas están disponibles dentro de Claude Code. Podés pedirle a Claude que las use, o las va a usar automáticamente según el contexto.
 

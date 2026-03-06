@@ -5,19 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.0] - Planned
+## [0.7.0] - 2026-03-06
 
 ### Added
 - **Progressive Disclosure**: 3 levels of context injection adapted to the event source
   - Level 1 (Index Card, ~150 tok): on `/clear` — summary 1-liner + task/step + 1 prompt
   - Level 2 (Full Startup, ~1000 tok): on new session — full summary + cross-session curated + thinking + actions + top scored
   - Level 3 (Full Recovery, ~1400 tok): on compact/resume — everything + 5 thinking blocks + 10 actions + top 10 + transcript thinking
-- **Cross-session curated context**: structured data from previous session injected on startup — pending work, open decisions, blockers, high-impact actions (Edit/Write/Bash by score), last reasoning, last user request
-- `queryCuratedPrevSession()` — single CTE query joining sessions + execution_snapshots + user_prompts + turn_log
+- **Cross-session curated context**: structured data from previous session injected on startup — pending work, open decisions, blockers, technical state, confidence, high-impact actions (Edit/Write/Bash by score), last reasoning, last user request
+- **Schema migration v3→v4**: new columns `technical_state TEXT` and `confidence INTEGER` in `execution_snapshots`
+- `queryCuratedPrevSession()` — single CTE query joining sessions + execution_snapshots + user_prompts + turn_log (includes `technical_state` and `confidence`)
 - `queryPrevHighImpactActions()` — top 5 Edit/Write/Bash observations from previous session by composite_score
 - `getDisclosureLevel(source)` — selects level 1/2/3 based on source event (no heuristics)
 - `getRecentContext()` accepts `opts.level` for conditional queries per level
 - `buildHistoricalContext()` receives `level` for conditional rendering
+- `captureTechnicalState(cwd)` — captures TS errors and test summary in auto-snapshots (every 25 obs)
+- `confidence` parameter (integer 1-5) in `save_state` MCP tool — stored in `execution_snapshots.confidence`
+- `checkContextValidity(snapshot, cwd)` — detects files modified outside Claude Code via `git log` since last snapshot
 - Compact thinking capture from transcript (Phase 2)
 - Auto-snapshot extracts plan/execution from thinking (Phase 3)
 

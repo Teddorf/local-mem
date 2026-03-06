@@ -48,10 +48,19 @@ function freshSession() {
 }
 
 function cleanDb() {
-  closeDb();
-  try { unlinkSync(TEST_DB_PATH); } catch {}
-  try { unlinkSync(TEST_DB_PATH + '-wal'); } catch {}
-  try { unlinkSync(TEST_DB_PATH + '-shm'); } catch {}
+  try {
+    const db = getDb();
+    // Clear all data without dropping tables (avoids Windows file lock issues)
+    db.exec(`
+      DELETE FROM observation_scores;
+      DELETE FROM observations;
+      DELETE FROM user_prompts;
+      DELETE FROM execution_snapshots;
+      DELETE FROM session_summaries;
+      DELETE FROM turn_log;
+      DELETE FROM sessions;
+    `);
+  } catch {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -86,10 +95,10 @@ describe('db.mjs — Core CRUD', () => {
 
   // --- getDb / schema ---
   describe('getDb() — schema and connection', () => {
-    test('creates DB and applies schema v3', () => {
+    test('creates DB and applies schema v4', () => {
       const db = getDb();
       const row = db.prepare('SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1').get();
-      expect(row.version).toBe(3);
+      expect(row.version).toBe(4);
     });
 
     test('returns same singleton on repeated calls', () => {
@@ -822,7 +831,7 @@ describe('db.mjs — Cleanup & Export', () => {
       const status = getStatusData(TEST_CWD);
       expect(status.dbPath).toContain('test-e2e.db');
       expect(status.dbSize).toBeGreaterThan(0);
-      expect(status.schemaVersion).toBe(3);
+      expect(status.schemaVersion).toBe(4);
       expect(status.sessions.total).toBeGreaterThanOrEqual(1);
       expect(status.sessions.active).toBeGreaterThanOrEqual(1);
       expect(status.observations).toBeGreaterThanOrEqual(1);
@@ -1043,7 +1052,7 @@ describe('Full session lifecycle E2E', () => {
     expect(ctx.snapshot).toBeTruthy();
     expect(ctx.snapshot.current_task).toBe('Implementing JWT auth');
     expect(ctx.thinking).toBeTruthy();
-    expect(ctx.thinking.thinking_text).toContain('JWT validation');
+    expect(ctx.thinking[0].thinking_text).toContain('JWT validation');
     expect(ctx.prompts.length).toBe(2);
     expect(ctx.recentSessions.length).toBe(1);
     expect(ctx.topScored.length).toBeGreaterThan(0);
@@ -1259,7 +1268,7 @@ describe('MCP Server — Tool execution simulation', () => {
     insertObservation(sid, { tool_name: 'Bash', action: 'status test', cwd: TEST_CWD });
 
     const status = getStatusData(TEST_CWD);
-    expect(status.schemaVersion).toBe(3);
+    expect(status.schemaVersion).toBe(4);
     expect(status.sessions.total).toBeGreaterThanOrEqual(1);
     expect(status.observations).toBeGreaterThanOrEqual(1);
   });
@@ -1311,7 +1320,7 @@ describe('MCP Server — Tool execution simulation', () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 describe('MCP Server — JSON-RPC Protocol (subprocess)', () => {
   const SERVER_PATH = join(import.meta.dirname, '..', 'mcp', 'server.mjs');
-  const BUN_PATH = '/sessions/eloquent-sleepy-brahmagupta/bun-install/node_modules/.bin/bun';
+  const BUN_PATH = process.execPath;
 
   beforeEach(() => { cleanDb(); });
   afterEach(() => { closeDb(); });
@@ -1609,10 +1618,10 @@ describe('DB Schema & Migration', () => {
   beforeEach(() => { cleanDb(); });
   afterEach(() => { closeDb(); });
 
-  test('fresh DB starts at schema v3', () => {
+  test('fresh DB starts at schema v4', () => {
     const db = getDb();
     const row = db.prepare('SELECT version FROM schema_version').get();
-    expect(row.version).toBe(3);
+    expect(row.version).toBe(4);
   });
 
   test('execution_snapshots has v2 columns', () => {
@@ -1620,6 +1629,13 @@ describe('DB Schema & Migration', () => {
     const columns = db.prepare(`PRAGMA table_info(execution_snapshots)`).all().map(c => c.name);
     expect(columns).toContain('snapshot_type');
     expect(columns).toContain('task_status');
+  });
+
+  test('execution_snapshots has v4 columns (technical_state, confidence)', () => {
+    const db = getDb();
+    const columns = db.prepare(`PRAGMA table_info(execution_snapshots)`).all().map(c => c.name);
+    expect(columns).toContain('technical_state');
+    expect(columns).toContain('confidence');
   });
 
   test('turn_log table exists with proper schema', () => {

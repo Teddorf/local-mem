@@ -2,6 +2,8 @@ import { readStdin } from './stdin.mjs';
 import { getDb, ensureSession, insertObservation, normalizeCwd, insertObservationScore, getSessionStats, saveExecutionSnapshot, getRecentObservations, pruneAutoSnapshots, getRecentPrompts } from './db.mjs';
 import { redact, isSensitiveFile, truncate } from './redact.mjs';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
+import { execSync } from 'node:child_process';
 
 const SKIP_TOOLS = new Set([
   'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'ToolSearch',
@@ -167,6 +169,32 @@ function computeScore(toolName, action) {
   return 0.4 * impact + 0.2 * errorFlag + 0.1 * toolWeight;
 }
 
+function captureTechnicalState(cwd) {
+  const state = {};
+  const timeout = 10_000;
+
+  // Solo si existe tsconfig.json
+  try {
+    if (existsSync(path.join(cwd, 'tsconfig.json'))) {
+      const stdout = execSync('npx tsc --noEmit 2>&1 | grep -c "error TS" || echo 0',
+        { cwd, timeout, encoding: 'utf8' });
+      state.ts_errors = parseInt(stdout.trim()) || 0;
+    }
+  } catch { /* no tsconfig or timeout — skip */ }
+
+  // Solo si existe tests/ o __tests__
+  try {
+    const hasTests = existsSync(path.join(cwd, 'tests')) || existsSync(path.join(cwd, '__tests__'));
+    if (hasTests) {
+      const stdout = execSync('bun test 2>&1 | tail -3',
+        { cwd, timeout, encoding: 'utf8' });
+      state.test_summary = stdout.trim().slice(0, 200);
+    }
+  } catch { /* timeout or no tests — skip */ }
+
+  return Object.keys(state).length > 0 ? JSON.stringify(state) : null;
+}
+
 function isReadDuplicate(db, session_id, action, cwd) {
   const nCwd = normalizeCwd(cwd);
   const row = db.prepare(
@@ -251,6 +279,12 @@ try {
         }
       }
 
+      // v0.7: capture technical state (sync, best-effort)
+      let technicalState = null;
+      try {
+        technicalState = captureTechnicalState(cwd);
+      } catch { /* best-effort */ }
+
       saveExecutionSnapshot(session_id, {
         cwd,
         current_task: `Auto-snapshot at ${stats.observation_count} observations`,
@@ -258,7 +292,8 @@ try {
         next_action: lastPrompts.slice(0, 300),
         active_files: [...activeFilesSet].slice(0, 20),
         snapshot_type: 'auto',
-        task_status: 'in_progress'
+        task_status: 'in_progress',
+        technical_state: technicalState,
       });
       pruneAutoSnapshots(session_id, cwd, 3);
     }

@@ -773,15 +773,15 @@ Mejoras vs actual en negrita.
 
 ---
 
-## Orden de implementacion
+## Orden de implementacion (completado v0.7.0, 2026-03-06)
 
-1. `db.mjs`: schema migration v3 (technical_state, confidence), parametrizar `getRecentContext()` con `level`, agregar `queryCuratedPrevSession()` y `queryPrevHighImpactActions()`
-2. `mcp/server.mjs`: agregar `confidence` param a `save_state`
-3. `session-start.mjs`: agregar `getDisclosureLevel()`, pasar `level` al flujo
-4. `session-start.mjs`: refactorear `buildHistoricalContext()` con render condicional
-5. `session-start.mjs`: agregar `checkContextValidity()` para avisos de archivos modificados
-6. `observation.mjs`: agregar `captureTechnicalState()` en auto-snapshot
-7. Test manual: verificar output de cada nivel con datos reales
+1. `db.mjs`: schema migration v3→v4 (`technical_state TEXT`, `confidence INTEGER`), parametrizar `getRecentContext()` con `level`, agregar `queryCuratedPrevSession()` y `queryPrevHighImpactActions()` — hecho
+2. `mcp/server.mjs`: agregar `confidence` param a `save_state` — hecho
+3. `session-start.mjs`: agregar `getDisclosureLevel()`, pasar `level` al flujo — hecho
+4. `session-start.mjs`: refactorear `buildHistoricalContext()` con render condicional por nivel — hecho
+5. `session-start.mjs`: agregar `checkContextValidity()` para avisos de archivos modificados fuera de Claude Code — hecho
+6. `observation.mjs`: agregar `captureTechnicalState()` en auto-snapshot — hecho
+7. Test manual: verificar output de cada nivel con datos reales — hecho
 
 ---
 

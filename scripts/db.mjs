@@ -319,6 +319,23 @@ export function getDb(dbPath) {
     }
   }
 
+  if (currentVersion < 4) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // v0.7 Progressive Disclosure: vibe awareness columns
+      db.exec(`ALTER TABLE execution_snapshots ADD COLUMN technical_state TEXT`);
+      db.exec(`ALTER TABLE execution_snapshots ADD COLUMN confidence INTEGER`);
+
+      db.exec(`UPDATE schema_version SET version=4, applied_at=unixepoch() WHERE rowid=1`);
+
+      db.exec('COMMIT');
+      process.stderr.write('[local-mem] Migration v3→v4 applied\n');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw new Error(`Migration v3→v4 failed: ${e.message}`);
+    }
+  }
+
   return db;
 }
 
@@ -435,8 +452,8 @@ export function saveExecutionSnapshot(sessionId, data) {
       INSERT INTO execution_snapshots
         (session_id, cwd, current_task, execution_point, next_action,
          pending_tasks, plan, open_decisions, active_files, blocking_issues,
-         snapshot_type, task_status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+         snapshot_type, task_status, technical_state, confidence, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
     `).run(
       sessionId,
       nCwd,
@@ -449,7 +466,9 @@ export function saveExecutionSnapshot(sessionId, data) {
       jsonStringify(data.active_files),
       jsonStringify(data.blocking_issues),
       data.snapshot_type || 'manual',
-      data.task_status || 'in_progress'
+      data.task_status || 'in_progress',
+      data.technical_state || null,
+      data.confidence != null ? data.confidence : null
     );
     return { id: Number(result.lastInsertRowid) };
   } finally {
@@ -567,14 +586,9 @@ function getThreshold(scores) {
 export function getRecentContext(cwd, opts = {}) {
   const db = getDb();
   const nCwd = normalizeCwd(cwd);
-  const limit = opts.limit || 30;
+  const level = opts.level || 2;
   try {
-    const observations = db.prepare(`
-      SELECT o.id, o.tool_name, o.action, o.files, o.detail, o.cwd, o.created_at
-      FROM observations o WHERE o.cwd = ?
-      ORDER BY o.created_at DESC LIMIT ?
-    `).all(nCwd, limit);
-
+    // === SIEMPRE (todos los niveles) ===
     const summary = db.prepare(`
       SELECT id, session_id, project, cwd, summary_text, tools_used, files_read,
              files_modified, observation_count, prompt_count, duration_seconds, created_at
@@ -586,22 +600,47 @@ export function getRecentContext(cwd, opts = {}) {
     const snapshot = db.prepare(`
       SELECT id, session_id, cwd, current_task, execution_point, next_action,
              pending_tasks, plan, open_decisions, active_files, blocking_issues,
-             snapshot_type, task_status, created_at
+             snapshot_type, task_status, technical_state, confidence, created_at
       FROM execution_snapshots WHERE cwd = ?
       ORDER BY CASE WHEN snapshot_type = 'manual' THEN 0 ELSE 1 END, created_at DESC
       LIMIT 1
     `).get(nCwd) || null;
 
-    // v0.7: ultimos 5 thinking blocks (viejo→nuevo para contexto)
+    // === Nivel 1: minimo ===
+    if (level === 1) {
+      const prompts = db.prepare(`
+        SELECT p.prompt_text, p.created_at
+        FROM user_prompts p
+        JOIN sessions s ON s.session_id = p.session_id
+        WHERE s.cwd = ?
+        ORDER BY p.created_at DESC LIMIT 1
+      `).all(nCwd);
+      return { observations: [], summary, snapshot, thinking: null,
+               topScored: [], prompts, recentSessions: [],
+               prevSession: null, prevActions: [] };
+    }
+
+    // === Nivel 2+: contexto completo ===
+    const promptLimit = 5;
+    const obsLimit = level === 3 ? 10 : 5;
+    const topLimit = level === 3 ? 10 : 7;
+
+    const observations = db.prepare(`
+      SELECT o.id, o.tool_name, o.action, o.files, o.detail, o.cwd, o.created_at
+      FROM observations o WHERE o.cwd = ?
+      ORDER BY o.created_at DESC LIMIT ?
+    `).all(nCwd, obsLimit);
+
+    // Thinking blocks (viejo→nuevo para contexto): nivel 2 = 3, nivel 3 = 5
+    const thinkingLimit = level === 3 ? 5 : 3;
     const thinkingRows = db.prepare(`
       SELECT thinking_text, response_text, created_at
       FROM turn_log WHERE cwd = ?
-      ORDER BY created_at DESC LIMIT 5
-    `).all(nCwd);
-    // Reverse so oldest is first (chronological order)
+      ORDER BY created_at DESC LIMIT ?
+    `).all(nCwd, thinkingLimit);
     const thinking = thinkingRows.length > 0 ? thinkingRows.reverse() : null;
 
-    // v0.6: top observaciones por score con threshold dinamico (recency at query-time)
+    // Top observaciones por score con threshold dinamico
     const allScored = db.prepare(`
       WITH scored AS (
         SELECT o.id, o.tool_name, o.action, o.created_at,
@@ -616,22 +655,21 @@ export function getRecentContext(cwd, opts = {}) {
     `).all(nCwd);
     const threshold = getThreshold(allScored.map(r => r.composite_score));
     let topScored = allScored.filter(r => r.composite_score >= threshold);
-    // Fallback: if < 5 pass threshold, use top 5 anyway
     if (topScored.length < 5 && allScored.length >= 5) {
       topScored = allScored.slice(0, 5);
     }
-    topScored = topScored.slice(0, 10);
+    topScored = topScored.slice(0, topLimit);
 
-    // v0.6: ultimos 3 prompts
     const prompts = db.prepare(`
       SELECT p.prompt_text, p.created_at
       FROM user_prompts p
       JOIN sessions s ON s.session_id = p.session_id
       WHERE s.cwd = ?
-      ORDER BY p.created_at DESC LIMIT 3
-    `).all(nCwd);
+      ORDER BY p.created_at DESC LIMIT ?
+    `).all(nCwd, promptLimit);
 
-    // v0.6: ultimas 3 sesiones con metadata + archivos clave
+    // Sesiones index: nivel 2 = 3, nivel 3 = 1
+    const sessionIndexLimit = level === 3 ? 1 : 3;
     const recentSessions = db.prepare(`
       SELECT s.session_id, s.project, s.started_at, s.completed_at, s.status,
              s.observation_count, s.prompt_count,
@@ -639,13 +677,82 @@ export function getRecentContext(cwd, opts = {}) {
       FROM sessions s
       LEFT JOIN session_summaries ss ON ss.session_id = s.session_id
       WHERE s.cwd = ?
-      ORDER BY s.started_at DESC LIMIT 3
-    `).all(nCwd);
+      ORDER BY s.started_at DESC LIMIT ?
+    `).all(nCwd, sessionIndexLimit);
 
-    return { observations, summary, snapshot, thinking, topScored, prompts, recentSessions };
+    // Cross-session curada (nivel 2+ — contexto perdido = bugs)
+    const prevSession = queryCuratedPrevSession(db, nCwd);
+    let prevActions = [];
+    if (prevSession) {
+      prevActions = queryPrevHighImpactActions(db, nCwd);
+    }
+
+    return { observations, summary, snapshot, thinking, topScored,
+             prompts, recentSessions, prevSession, prevActions };
   } finally {
     db.close();
   }
+}
+
+/**
+ * Datos curados de la sesion anterior.
+ * Cruza sessions + execution_snapshots + user_prompts + turn_log
+ * para extraer lo ACCIONABLE, no un resumen generico.
+ */
+function queryCuratedPrevSession(db, nCwd) {
+  return db.prepare(`
+    WITH prev_session AS (
+      SELECT session_id, started_at, completed_at, observation_count, status
+      FROM sessions WHERE cwd = ?
+      ORDER BY started_at DESC LIMIT 1 OFFSET 1
+    )
+    SELECT
+      ps.session_id,
+      ps.started_at,
+      ps.status,
+      ps.observation_count,
+      es.current_task,
+      es.next_action,
+      es.open_decisions,
+      es.blocking_issues,
+      es.active_files,
+      es.technical_state,
+      es.confidence,
+      (SELECT prompt_text FROM user_prompts
+       WHERE session_id = ps.session_id
+       ORDER BY created_at DESC LIMIT 1) AS last_prompt,
+      (SELECT thinking_text FROM turn_log
+       WHERE session_id = ps.session_id
+       ORDER BY created_at DESC LIMIT 1) AS last_thinking
+    FROM prev_session ps
+    LEFT JOIN execution_snapshots es
+      ON es.session_id = ps.session_id
+      AND es.id = (
+        SELECT id FROM execution_snapshots
+        WHERE session_id = ps.session_id
+        ORDER BY CASE WHEN snapshot_type='manual' THEN 0 ELSE 1 END,
+                 created_at DESC
+        LIMIT 1
+      )
+  `).get(nCwd) || null;
+}
+
+/**
+ * Top 5 acciones de alto impacto de la sesion anterior.
+ * Solo Edit/Write/Bash — las que cambiaron algo.
+ */
+function queryPrevHighImpactActions(db, nCwd) {
+  return db.prepare(`
+    SELECT o.tool_name, o.action, o.files, o.detail
+    FROM observations o
+    JOIN (SELECT session_id FROM sessions WHERE cwd = ?
+          ORDER BY started_at DESC LIMIT 1 OFFSET 1) ps
+      ON o.session_id = ps.session_id
+    LEFT JOIN observation_scores s ON s.observation_id = o.id
+    WHERE o.tool_name IN ('Edit', 'Write', 'Bash')
+    ORDER BY s.composite_score DESC
+    LIMIT 5
+  `).all(nCwd);
 }
 
 export function pruneAutoSnapshots(sessionId, cwd, maxKeep = 3) {
@@ -725,7 +832,7 @@ export function getLatestSnapshot(cwd, snapshotType) {
       return db.prepare(`
         SELECT id, session_id, cwd, current_task, execution_point, next_action,
                pending_tasks, plan, open_decisions, active_files, blocking_issues,
-               snapshot_type, task_status, created_at
+               snapshot_type, task_status, technical_state, confidence, created_at
         FROM execution_snapshots WHERE cwd = ? AND snapshot_type = ?
         ORDER BY created_at DESC LIMIT 1
       `).get(nCwd, snapshotType) || null;
@@ -733,7 +840,7 @@ export function getLatestSnapshot(cwd, snapshotType) {
     return db.prepare(`
       SELECT id, session_id, cwd, current_task, execution_point, next_action,
              pending_tasks, plan, open_decisions, active_files, blocking_issues,
-             snapshot_type, task_status, created_at
+             snapshot_type, task_status, technical_state, confidence, created_at
       FROM execution_snapshots WHERE cwd = ?
       ORDER BY created_at DESC LIMIT 1
     `).get(nCwd) || null;

@@ -204,6 +204,12 @@ const TOOLS = [
           description: 'Status of the task (default "in_progress")',
           default: 'in_progress',
         },
+        confidence: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 5,
+          description: 'Confidence level 1-5: 1=exploring, 2=partial, 3=tests pass, 4=reviewed, 5=ready to ship',
+        },
       },
       required: ['current_task'],
     },
@@ -334,6 +340,11 @@ function formatContextMarkdown(ctx) {
     }
   }
 
+  // --- Cross-session curada ---
+  if (ctx.prevSession) {
+    renderCrossSessionMcp(lines, ctx.prevSession, ctx.prevActions);
+  }
+
   // --- Saved state ---
   if (snapshot) {
     const snapshotType = snapshot.snapshot_type ? ` [${sanitizeXml(snapshot.snapshot_type)}]` : '';
@@ -361,6 +372,18 @@ function formatContextMarkdown(ctx) {
           lines.push(`- Bloqueantes: ${issues.map(i => sanitizeXml(String(i))).join(', ')}`);
         }
       } catch {}
+    }
+
+    // v0.7: confidence
+    if (snapshot.confidence) {
+      const labels = {
+        1: 'explorando, no se si funciona',
+        2: 'implementado parcialmente, no testeado',
+        3: 'tests pasan pero no revisado',
+        4: 'revisado, falta probar manualmente',
+        5: 'listo para merge/deploy'
+      };
+      lines.push(`- Confianza: ${snapshot.confidence}/5${labels[snapshot.confidence] ? ` — ${labels[snapshot.confidence]}` : ''}`);
     }
   }
 
@@ -449,6 +472,71 @@ function formatContextMarkdown(ctx) {
   lines.push('</local-mem-data>');
 
   return lines.join('\n');
+}
+
+function parseJsonSafe(value) {
+  if (!value) return null;
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+function renderCrossSessionMcp(lines, prevData, prevActions) {
+  if (!prevData) return;
+
+  const age = prevData.started_at ? formatAge(prevData.started_at) : '?';
+  lines.push('');
+  lines.push(`## Sesion anterior (hace ${age})`);
+
+  if (prevData.next_action) {
+    lines.push(`- Pendiente: ${sanitizeXml(truncate(prevData.next_action, 200))}`);
+  }
+
+  const decisions = parseJsonSafe(prevData.open_decisions);
+  if (Array.isArray(decisions) && decisions.length > 0) {
+    lines.push(`- Decisiones sin resolver: ${decisions.map(d => sanitizeXml(String(d))).join('; ')}`);
+  }
+
+  const issues = parseJsonSafe(prevData.blocking_issues);
+  if (Array.isArray(issues) && issues.length > 0) {
+    lines.push(`- Bloqueantes: ${issues.map(i => sanitizeXml(String(i))).join('; ')}`);
+  }
+
+  if (prevData.technical_state) {
+    const ts = parseJsonSafe(prevData.technical_state);
+    if (ts) {
+      const parts = [];
+      if (ts.ts_errors !== undefined) parts.push(`${ts.ts_errors} TS errors`);
+      if (ts.test_summary) parts.push(sanitizeXml(ts.test_summary));
+      if (parts.length > 0) lines.push(`- Estado tecnico al cerrar: ${parts.join(', ')}`);
+    }
+  }
+
+  if (prevData.confidence) {
+    lines.push(`- Confianza al cerrar: ${prevData.confidence}/5`);
+  }
+
+  if (prevActions && prevActions.length > 0) {
+    const fileSet = new Set();
+    for (const a of prevActions) {
+      lines.push(`- ${a.tool_name}: ${sanitizeXml(truncate(a.action, 80))}`);
+      if (a.files) {
+        const files = parseJsonSafe(a.files);
+        if (Array.isArray(files)) files.forEach(f => f && fileSet.add(f));
+      }
+    }
+    if (fileSet.size > 0) {
+      const shown = [...fileSet].slice(0, 5).map(f => sanitizeXml(String(f))).join(', ');
+      lines.push(`- Archivos tocados: ${shown}`);
+    }
+  }
+
+  if (prevData.last_thinking) {
+    lines.push(`- Ultimo razonamiento: ${sanitizeXml(truncate(prevData.last_thinking, 300))}`);
+  }
+
+  if (prevData.last_prompt) {
+    lines.push(`- Ultimo pedido: "${sanitizeXml(truncate(prevData.last_prompt, 120))}"`);
+  }
 }
 
 function formatAge(epoch) {
@@ -569,7 +657,7 @@ async function executeTool(name, params) {
 
     // ---- context ----
     case 'context': {
-      const ctx = getRecentContext(cwd);
+      const ctx = getRecentContext(cwd, { level: 2 });
       const md = formatContextMarkdown(ctx);
       return { content: [{ type: 'text', text: md }] };
     }
@@ -614,10 +702,13 @@ async function executeTool(name, params) {
 
       const validStatuses = ['in_progress', 'completed', 'blocked', 'cancelled'];
       const taskStatus = validStatuses.includes(params.task_status) ? params.task_status : 'in_progress';
+      const confidence = Number.isInteger(params.confidence) && params.confidence >= 1 && params.confidence <= 5
+        ? params.confidence : null;
       const result = saveExecutionSnapshot(sessionId, {
         cwd, ...redacted,
         snapshot_type: 'manual',
         task_status: taskStatus,
+        confidence,
       });
       return toolResult(result);
     }
