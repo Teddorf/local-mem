@@ -61,7 +61,7 @@ function extractTranscriptSummary(transcriptPath) {
   }
 }
 
-function buildStructuredSummary(sessionId, cwd, opts = {}) {
+export function buildStructuredSummary(sessionId, cwd, opts = {}) {
   try {
     const tools_used = opts.tools_used || {};
     const files_modified = opts.files_modified || [];
@@ -212,76 +212,84 @@ function getToolsAndFiles(sessionId) {
   }
 }
 
-try {
-  const input = await readStdin();
-  const { session_id, cwd, transcript_path } = input;
+async function main() {
+  try {
+    const input = await readStdin();
+    const { session_id, cwd, transcript_path } = input;
 
-  if (!session_id || !cwd) {
-    if (!session_id) process.stderr.write('[local-mem] session-end: missing session_id\n');
-    if (!cwd) process.stderr.write('[local-mem] session-end: missing cwd\n');
-    process.exit(0);
-  }
-
-  let summaryText = null;
-  let useTranscript = false;
-
-  if (transcript_path) {
-    if (isAbsolute(transcript_path) && !transcript_path.includes('..')) {
-      useTranscript = true;
-    } else {
-      process.stderr.write('[local-mem] session-end: invalid transcript_path, skipping\n');
+    if (!session_id || !cwd) {
+      if (!session_id) process.stderr.write('[local-mem] session-end: missing session_id\n');
+      if (!cwd) process.stderr.write('[local-mem] session-end: missing cwd\n');
+      process.exit(0);
     }
-  }
 
-  const stats = getSessionStats(session_id);
-  const { tools_used, files_read, files_modified } = getToolsAndFiles(session_id);
+    let summaryText = null;
+    let useTranscript = false;
 
-  // Intentar resumen estructurado primero (datos DB) — reutiliza tools/files ya extraídos
-  summaryText = buildStructuredSummary(session_id, cwd, { tools_used, files_modified });
+    if (transcript_path) {
+      if (isAbsolute(transcript_path) && !transcript_path.includes('..')) {
+        useTranscript = true;
+      } else {
+        process.stderr.write('[local-mem] session-end: invalid transcript_path, skipping\n');
+      }
+    }
 
-  // Fallback: extraer del transcript
-  if (!summaryText && useTranscript) {
-    summaryText = extractTranscriptSummary(transcript_path);
-  }
+    const stats = getSessionStats(session_id);
+    const { tools_used, files_read, files_modified } = getToolsAndFiles(session_id);
 
-  if (useTranscript) {
-    try {
-      await extractThinkingFromTranscript(transcript_path, session_id, cwd);
-    } catch { /* best-effort — session still completes normally */ }
-  }
+    // Intentar resumen estructurado primero (datos DB) — reutiliza tools/files ya extraídos
+    summaryText = buildStructuredSummary(session_id, cwd, { tools_used, files_modified });
 
-  const now = Math.floor(Date.now() / 1000);
-  const startedAt = stats ? stats.started_at : null;
-  const durationSeconds = startedAt ? now - startedAt : null;
+    // Fallback: extraer del transcript
+    if (!summaryText && useTranscript) {
+      summaryText = extractTranscriptSummary(transcript_path);
+    }
 
-  const nCwd = normalizeCwd(cwd || '');
-  const project = nCwd ? basename(nCwd) : '';
+    if (useTranscript) {
+      try {
+        await extractThinkingFromTranscript(transcript_path, session_id, cwd);
+      } catch { /* best-effort — session still completes normally */ }
+    }
 
-  const obsCount = stats ? stats.observation_count : 0;
-  const promptCount = stats ? stats.prompt_count : 0;
+    const now = Math.floor(Date.now() / 1000);
+    const startedAt = stats ? stats.started_at : null;
+    const durationSeconds = startedAt ? now - startedAt : null;
 
-  // Skip completing sessions with zero activity (ghost sessions)
-  if (obsCount === 0 && promptCount === 0) {
+    const nCwd = normalizeCwd(cwd || '');
+    const project = nCwd ? basename(nCwd) : '';
+
+    const obsCount = stats ? stats.observation_count : 0;
+    const promptCount = stats ? stats.prompt_count : 0;
+
+    // Skip completing sessions with zero activity (ghost sessions)
+    if (obsCount === 0 && promptCount === 0) {
+      process.stdout.write('Success\n');
+      process.exit(0);
+    }
+
+    completeSession(session_id, {
+      cwd: nCwd,
+      project,
+      summary_text: summaryText,
+      tools_used,
+      files_read,
+      files_modified,
+      observation_count: obsCount,
+      prompt_count: promptCount,
+      duration_seconds: durationSeconds
+    });
+
     process.stdout.write('Success\n');
     process.exit(0);
+  } catch (err) {
+    process.stderr.write(`[local-mem] Error: ${err.message}\n`);
+    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    process.exit(0);
   }
+}
 
-  completeSession(session_id, {
-    cwd: nCwd,
-    project,
-    summary_text: summaryText,
-    tools_used,
-    files_read,
-    files_modified,
-    observation_count: obsCount,
-    prompt_count: promptCount,
-    duration_seconds: durationSeconds
-  });
-
-  process.stdout.write('Success\n');
-  process.exit(0);
-} catch (err) {
-  process.stderr.write(`[local-mem] Error: ${err.message}\n`);
-  console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-  process.exit(0);
+// Only run main when executed directly (not when imported for testing)
+const isDirectRun = process.argv[1] && import.meta.path.endsWith(process.argv[1].replace(/\\/g, '/').split('/').pop());
+if (isDirectRun) {
+  main();
 }

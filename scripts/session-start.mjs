@@ -158,7 +158,7 @@ function checkContextValidity(snapshot, cwd) {
   return changed.length > 0 ? changed : null;
 }
 
-function groupObservations(observations) {
+export function groupObservations(observations) {
   const editGroups = new Map(); // file → [{action, detail}]
   const readGroups = new Map(); // file → count
   const ungrouped = []; // Bash, Agent, WebSearch, Grep, Glob, etc.
@@ -189,7 +189,7 @@ function groupObservations(observations) {
   return { editGroups, readGroups, ungrouped };
 }
 
-function renderGroupedObservations(lines, observations, maxLines) {
+export function renderGroupedObservations(lines, observations, maxLines) {
   const { editGroups, readGroups, ungrouped } = groupObservations(observations);
   let rendered = 0;
 
@@ -695,8 +695,12 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((err) => {
-  process.stderr.write(`[local-mem] session-start error: ${err?.message || err}\n`);
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: '' } }) + '\n');
-  process.exit(0);
-});
+// Only run main when executed directly (not when imported for testing)
+const isDirectRun = process.argv[1] && import.meta.path.endsWith(process.argv[1].replace(/\\/g, '/').split('/').pop());
+if (isDirectRun) {
+  main().catch((err) => {
+    process.stderr.write(`[local-mem] session-start error: ${err?.message || err}\n`);
+    process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: '' } }) + '\n');
+    process.exit(0);
+  });
+}
