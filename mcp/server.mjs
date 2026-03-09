@@ -25,6 +25,7 @@ import { readFileSync } from 'node:fs';
 import { redactObject } from '../scripts/redact.mjs';
 import { sanitizeXml, truncate } from '../scripts/redact.mjs';
 import { parseJsonSafe, formatTime, CONFIDENCE_LABELS } from '../scripts/shared.mjs';
+import { SIZES, MCP, TIME, PATTERNS, RENDER, LEVEL_LIMITS, TRUNCATE } from '../scripts/constants.mjs';
 
 const pkg = JSON.parse(readFileSync(import.meta.dirname + '/../package.json', 'utf8'));
 
@@ -326,21 +327,21 @@ function formatContextMarkdown(ctx) {
       }
     }
     if (allFiles.length > 0) {
-      const shown = allFiles.slice(0, 3).map(f => sanitizeXml(String(f))).join(', ');
-      const extra = allFiles.length > 3 ? ` (+${allFiles.length - 3} mas)` : '';
+      const shown = allFiles.slice(0, RENDER.MAX_SUMMARY_FILES).map(f => sanitizeXml(String(f))).join(', ');
+      const extra = allFiles.length > RENDER.MAX_SUMMARY_FILES ? ` (+${allFiles.length - RENDER.MAX_SUMMARY_FILES} mas)` : '';
       lines.push(`- Archivos: ${shown}${extra}`);
     }
 
     const dParts = [];
     if (summary.duration_seconds) {
-      const mins = Math.round(summary.duration_seconds / 60);
+      const mins = Math.round(summary.duration_seconds / TIME.SECONDS_PER_MINUTE);
       dParts.push(`${mins} min`);
     }
     if (summary.observation_count) dParts.push(`${summary.observation_count} obs`);
     if (dParts.length) lines.push(`- ${dParts.join(', ')}`);
 
     if (summary.summary_text) {
-      lines.push(`- Resultado: ${sanitizeXml(truncate(summary.summary_text, 200))}`);
+      lines.push(`- Resultado: ${sanitizeXml(truncate(summary.summary_text, TRUNCATE.SUMMARY_FILE))}`);
     }
   }
 
@@ -391,7 +392,7 @@ function formatContextMarkdown(ctx) {
     for (const t of thinking) {
       if (t.thinking_text) {
         const time = t.created_at ? formatTime(t.created_at) : '?';
-        lines.push(`- [${time}] ${sanitizeXml(truncate(t.thinking_text, 500))}`);
+        lines.push(`- [${time}] ${sanitizeXml(truncate(t.thinking_text, TRUNCATE.THINKING_TEXT))}`);
       }
     }
   }
@@ -402,20 +403,20 @@ function formatContextMarkdown(ctx) {
     lines.push('## Ultimos pedidos del usuario');
     for (const p of prompts) {
       const time = p.created_at ? formatTime(p.created_at) : '?';
-      const text = sanitizeXml(truncate(p.prompt_text || '', 120));
+      const text = sanitizeXml(truncate(p.prompt_text || '', TRUNCATE.PROMPT_TEXT));
       lines.push(`- [${time}] "${text}"`);
     }
   }
 
-  // --- Recent activity (top 5, bullets) ---
+  // --- Recent activity (bullets) ---
   if (observations && observations.length > 0) {
     lines.push('');
-    lines.push('## Ultimas 5 acciones');
+    lines.push(`## Ultimas ${Math.min(observations.length, LEVEL_LIMITS[2].observations)} acciones`);
 
-    for (const obs of observations.slice(0, 5)) {
+    for (const obs of observations.slice(0, LEVEL_LIMITS[2].observations)) {
       const time = obs.created_at ? formatTime(obs.created_at) : '?';
-      let action = sanitizeXml(truncate(obs.action || '', 100));
-      if (obs.detail) action = `${action}: ${sanitizeXml(truncate(obs.detail, 100))}`;
+      let action = sanitizeXml(truncate(obs.action || '', TRUNCATE.OBS_ACTION));
+      if (obs.detail) action = `${action}: ${sanitizeXml(truncate(obs.detail, TRUNCATE.OBS_ACTION))}`;
       lines.push(`- #${obs.id} ${time} ${action}`);
     }
   }
@@ -425,9 +426,9 @@ function formatContextMarkdown(ctx) {
     lines.push('');
     lines.push('## Top por relevancia');
 
-    for (const obs of topScored.slice(0, 7)) {
+    for (const obs of topScored.slice(0, LEVEL_LIMITS[2].topScored)) {
       const time = obs.created_at ? formatTime(obs.created_at) : '?';
-      const action = sanitizeXml(truncate(obs.action || '', 80));
+      const action = sanitizeXml(truncate(obs.action || '', TRUNCATE.OBS_SCORED_ACTION));
       const score = obs.composite_score != null ? Number(obs.composite_score).toFixed(2) : '';
       lines.push(`- #${obs.id} ${time} ${action} [${score}]`);
     }
@@ -441,8 +442,8 @@ function formatContextMarkdown(ctx) {
     lines.push('| Sesion | Fecha | Obs | Archivos clave |');
     lines.push('|--------|-------|-----|----------------|');
 
-    for (const sess of recentSessions.slice(0, 3)) {
-      const sesId = sanitizeXml(String(sess.session_id || '').slice(0, 8));
+    for (const sess of recentSessions.slice(0, LEVEL_LIMITS[2].recentSessions)) {
+      const sesId = sanitizeXml(String(sess.session_id || '').slice(0, RENDER.SESSION_ID_DISPLAY_LEN));
       const age = sess.started_at ? formatAge(sess.started_at) : '?';
       const obsCount = sess.observation_count ?? '';
       let keyFiles = '';
@@ -457,8 +458,8 @@ function formatContextMarkdown(ctx) {
           }
         }
         if (sf.length > 0) {
-          keyFiles = sf.slice(0, 2).map(f => sanitizeXml(String(f))).join(', ');
-          if (sf.length > 2) keyFiles += ` +${sf.length - 2}`;
+          keyFiles = sf.slice(0, RENDER.MAX_KEY_FILES_INDEX).map(f => sanitizeXml(String(f))).join(', ');
+          if (sf.length > RENDER.MAX_KEY_FILES_INDEX) keyFiles += ` +${sf.length - RENDER.MAX_KEY_FILES_INDEX}`;
         }
       }
       lines.push(`| ${sesId} | hace ${age} | ${obsCount} | ${keyFiles} |`);
@@ -479,7 +480,7 @@ function renderCrossSessionMcp(lines, prevData, prevActions) {
   lines.push(`## Sesion anterior (hace ${age})`);
 
   if (prevData.next_action) {
-    lines.push(`- Pendiente: ${sanitizeXml(truncate(prevData.next_action, 200))}`);
+    lines.push(`- Pendiente: ${sanitizeXml(truncate(prevData.next_action, TRUNCATE.CROSS_SESSION_ACTION))}`);
   }
 
   const decisions = parseJsonSafe(prevData.open_decisions);
@@ -509,33 +510,33 @@ function renderCrossSessionMcp(lines, prevData, prevActions) {
   if (prevActions && prevActions.length > 0) {
     const fileSet = new Set();
     for (const a of prevActions) {
-      lines.push(`- ${a.tool_name}: ${sanitizeXml(truncate(a.action, 80))}`);
+      lines.push(`- ${a.tool_name}: ${sanitizeXml(truncate(a.action, TRUNCATE.OBS_SCORED_ACTION))}`);
       if (a.files) {
         const files = parseJsonSafe(a.files);
         if (Array.isArray(files)) files.forEach(f => f && fileSet.add(f));
       }
     }
     if (fileSet.size > 0) {
-      const shown = [...fileSet].slice(0, 5).map(f => sanitizeXml(String(f))).join(', ');
+      const shown = [...fileSet].slice(0, RENDER.MAX_FILES_CROSS_SESSION).map(f => sanitizeXml(String(f))).join(', ');
       lines.push(`- Archivos tocados: ${shown}`);
     }
   }
 
   if (prevData.last_thinking) {
-    lines.push(`- Ultimo razonamiento: ${sanitizeXml(truncate(prevData.last_thinking, 300))}`);
+    lines.push(`- Ultimo razonamiento: ${sanitizeXml(truncate(prevData.last_thinking, TRUNCATE.RESPONSE_TEXT))}`);
   }
 
   if (prevData.last_prompt) {
-    lines.push(`- Ultimo pedido: "${sanitizeXml(truncate(prevData.last_prompt, 120))}"`);
+    lines.push(`- Ultimo pedido: "${sanitizeXml(truncate(prevData.last_prompt, TRUNCATE.PROMPT_TEXT))}"`);
   }
 }
 
 function formatAge(epoch) {
   const diff = Math.floor(Date.now() / 1000) - epoch;
-  if (diff < 60) return `${diff}s`;
-  if (diff < 3600) return `${Math.round(diff / 60)}m`;
-  if (diff < 86400) return `${Math.round(diff / 3600)}h`;
-  return `${Math.round(diff / 86400)}d`;
+  if (diff < TIME.SECONDS_PER_MINUTE) return `${diff}s`;
+  if (diff < TIME.SECONDS_PER_HOUR) return `${Math.round(diff / TIME.SECONDS_PER_MINUTE)}m`;
+  if (diff < TIME.SECONDS_PER_DAY) return `${Math.round(diff / TIME.SECONDS_PER_HOUR)}h`;
+  return `${Math.round(diff / TIME.SECONDS_PER_DAY)}d`;
 }
 
 // ---------------------------------------------------------------------------
@@ -571,14 +572,14 @@ async function executeTool(name, params) {
       if (!params.query || typeof params.query !== 'string') {
         return toolError('Missing required param: query');
       }
-      const limit = Math.min(Math.max(parseInt(params.limit, 10) || 20, 1), 100);
+      const limit = Math.min(Math.max(parseInt(params.limit, 10) || MCP.SEARCH_LIMIT_DEFAULT, 1), MCP.SEARCH_LIMIT_MAX);
       const results = searchObservations(params.query, cwd, { limit });
       return toolResult(results);
     }
 
     // ---- recent ----
     case 'recent': {
-      const limit = Math.min(Math.max(parseInt(params.limit, 10) || 30, 1), 100);
+      const limit = Math.min(Math.max(parseInt(params.limit, 10) || MCP.RECENT_LIMIT_DEFAULT, 1), MCP.RECENT_LIMIT_MAX);
       const results = getRecentObservations(cwd, { limit });
       return toolResult(results);
     }
@@ -593,7 +594,7 @@ async function executeTool(name, params) {
 
     // ---- cleanup ----
     case 'cleanup': {
-      const days = Math.max(parseInt(params.older_than_days, 10) || 90, 7);
+      const days = Math.max(parseInt(params.older_than_days, 10) || TIME.CLEANUP_DEFAULT_DAYS, 7);
       const preview = params.preview !== false;
       if (preview) {
         const targets = getCleanupTargets(cwd, days);
@@ -606,7 +607,7 @@ async function executeTool(name, params) {
     // ---- export ----
     case 'export': {
       const format = params.format === 'csv' ? 'csv' : 'json';
-      const limit = Math.min(Math.max(parseInt(params.limit, 10) || 500, 1), 500);
+      const limit = Math.min(Math.max(parseInt(params.limit, 10) || MCP.EXPORT_LIMIT_DEFAULT, 1), MCP.EXPORT_LIMIT_DEFAULT);
       const offset = Math.max(parseInt(params.offset, 10) || 0, 0);
       const result = getExportData(cwd, format, limit, offset);
       return toolResult(result);
@@ -620,7 +621,7 @@ async function executeTool(name, params) {
       if (!Array.isArray(params.ids) || params.ids.length === 0) {
         return toolError('ids must be a non-empty array of numbers');
       }
-      if (params.ids.length > 50) {
+      if (params.ids.length > MCP.MAX_FORGET_IDS) {
         return toolError('Max 50 IDs per request');
       }
       const ids = params.ids.map(id => Number(id)).filter(id => Number.isInteger(id) && id > 0);
@@ -653,7 +654,7 @@ async function executeTool(name, params) {
       }
 
       // Validate field sizes (max 10KB each)
-      const MAX_FIELD = 10240;
+      const MAX_FIELD = SIZES.MAX_SNAPSHOT_FIELD;
       const fieldNames = [
         'current_task', 'execution_point', 'next_action',
         'pending_tasks', 'plan', 'open_decisions', 'active_files', 'blocking_issues',
@@ -715,7 +716,7 @@ async function executeTool(name, params) {
       if (!params.query || typeof params.query !== 'string') {
         return toolError('Missing required param: query');
       }
-      const limit = Math.min(Math.max(parseInt(params.limit, 10) || 10, 1), 50);
+      const limit = Math.min(Math.max(parseInt(params.limit, 10) || MCP.THINKING_SEARCH_LIMIT, 1), 50);
       const results = searchThinking(params.query, cwd, { limit });
       return toolResult(results);
     }
@@ -724,7 +725,7 @@ async function executeTool(name, params) {
     case 'top_priority': {
       const raw = parseFloat(params.min_score);
       const minScore = Math.max(Number.isFinite(raw) ? raw : 0.4, 0);
-      const limit = Math.min(Math.max(parseInt(params.limit, 10) || 15, 1), 50);
+      const limit = Math.min(Math.max(parseInt(params.limit, 10) || MCP.TOP_PRIORITY_LIMIT, 1), 50);
       const results = getTopScoredObservations(cwd, { minScore, limit });
       return toolResult(results);
     }
@@ -817,7 +818,7 @@ async function handleMessage(msg) {
 // ---------------------------------------------------------------------------
 // stdin line buffering
 // ---------------------------------------------------------------------------
-const MAX_LINE_SIZE = 1_048_576; // 1MB
+const MAX_LINE_SIZE = SIZES.MAX_STDIN_BYTES;
 let buffer = '';
 
 process.stdin.setEncoding('utf8');

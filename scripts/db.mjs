@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { mkdirSync, statSync } from 'fs';
 import { dirname, basename } from 'path';
+import { SIZES, TIMEOUTS, DB, LEVEL_LIMITS, SCORING, TRUNCATE, RENDER, TIME } from './constants.mjs';
 
 const HOME = process.env.HOME || process.env.USERPROFILE;
 const DEFAULT_DB_PATH = `${HOME}/.local-mem/data/local-mem.db`;
@@ -156,11 +157,11 @@ function sanitizeFtsQuery(query) {
     .join(' ')
     .trim();
   if (!sanitized) return null;
-  if (sanitized.length > 500) sanitized = sanitized.slice(0, 500);
+  if (sanitized.length > SIZES.MAX_FTS_QUERY) sanitized = sanitized.slice(0, SIZES.MAX_FTS_QUERY);
   return sanitized;
 }
 
-const MAX_JSON_FIELD_SIZE = 10240;
+const MAX_JSON_FIELD_SIZE = SIZES.MAX_JSON_FIELD;
 
 function validateJsonFieldSize(value) {
   if (value && typeof value === 'string' && value.length > MAX_JSON_FIELD_SIZE) {
@@ -211,8 +212,8 @@ export function getDb(dbPath) {
   const db = new Database(resolvedPath, { create: true });
   db.exec('PRAGMA journal_mode=WAL');
   db.exec('PRAGMA foreign_keys=ON');
-  db.exec('PRAGMA busy_timeout=5000');
-  db.exec('PRAGMA wal_autocheckpoint=1000');
+  db.exec(`PRAGMA busy_timeout=${TIMEOUTS.DB_BUSY}`);
+  db.exec(`PRAGMA wal_autocheckpoint=${DB.WAL_AUTOCHECKPOINT}`);
   db.exec(SCHEMA_SQL);
 
   // Wrap close() to be a no-op for singleton — actual close via closeDb()
@@ -481,9 +482,9 @@ export function insertTurnLog(sessionId, cwd, turnData) {
   const nCwd = normalizeCwd(cwd);
   try {
     const thinkingText = turnData.thinking_text
-      ? turnData.thinking_text.slice(0, 4096) : null;  // max 4KB
+      ? turnData.thinking_text.slice(0, SIZES.MAX_THINKING_TEXT) : null;  // max 4KB
     const responseText = turnData.response_text
-      ? turnData.response_text.slice(0, 2048) : null;  // max 2KB
+      ? turnData.response_text.slice(0, SIZES.MAX_RESPONSE_TEXT) : null;  // max 2KB
     db.prepare(`
       INSERT INTO turn_log (session_id, cwd, turn_number, thinking_text, response_text, created_at)
       VALUES (?, ?, ?, ?, ?, unixepoch())
@@ -575,7 +576,7 @@ export function getKeyThinking(cwd, sessionId, limit = 5) {
     }
 
     // 3. Fallback: fill remaining slots with most recent (excluding duplicates)
-    const ftsIds = new Set(ftsResults.map(r => `${r.created_at}_${(r.thinking_text || '').slice(0, 50)}`));
+    const ftsIds = new Set(ftsResults.map(r => `${r.created_at}_${(r.thinking_text || '').slice(0, RENDER.THINKING_DEDUP_PREFIX)}`));
     const remaining = limit - ftsResults.length;
 
     const whereClause = sessionId
@@ -596,7 +597,7 @@ export function getKeyThinking(cwd, sessionId, limit = 5) {
     // Merge: FTS results + recent (deduplicated)
     const merged = [...ftsResults];
     for (const row of recentRows) {
-      const key = `${row.created_at}_${(row.thinking_text || '').slice(0, 50)}`;
+      const key = `${row.created_at}_${(row.thinking_text || '').slice(0, RENDER.THINKING_DEDUP_PREFIX)}`;
       if (!ftsIds.has(key) && merged.length < limit) {
         merged.push(row);
         ftsIds.add(key);
@@ -612,8 +613,8 @@ export function getKeyThinking(cwd, sessionId, limit = 5) {
 
 // Recency band applied at query-time: base_score + 0.3 * CASE(age)
 const RECENCY_SQL = `(s.composite_score + 0.3 * CASE
-  WHEN (unixepoch() - o.created_at) < 3600 THEN 1.0
-  WHEN (unixepoch() - o.created_at) < 21600 THEN 0.5
+  WHEN (unixepoch() - o.created_at) < ${SCORING.RECENCY_1H} THEN 1.0
+  WHEN (unixepoch() - o.created_at) < ${SCORING.RECENCY_6H} THEN 0.5
   ELSE 0.25 END)`;
 
 export function getTopScoredObservations(cwd, opts = {}) {
@@ -659,9 +660,9 @@ export function getRecentPrompts(cwd, limit = 3) {
 
 // Dynamic threshold: max(0.25, topScore * 0.5)
 function getThreshold(scores) {
-  if (!scores || scores.length === 0) return 0.25;
+  if (!scores || scores.length === 0) return SCORING.DEFAULT_THRESHOLD;
   const topScore = Math.max(...scores);
-  return Math.max(0.25, topScore * 0.5);
+  return Math.max(SCORING.DEFAULT_THRESHOLD, topScore * 0.5);
 }
 
 export function getRecentContext(cwd, opts = {}) {
@@ -702,7 +703,7 @@ export function getRecentContext(cwd, opts = {}) {
     }
 
     // === Nivel 2+: contexto completo ===
-    const topLimit = level === 3 ? 10 : 7;
+    const topLimit = LEVEL_LIMITS[level]?.topScored || LEVEL_LIMITS[2].topScored;
 
     // Sesión activa para nivel 3 (reutilizada en F2+F3)
     let activeSessionId = null;
@@ -721,10 +722,10 @@ export function getRecentContext(cwd, opts = {}) {
       observations = db.prepare(`
         SELECT o.id, o.tool_name, o.action, o.files, o.detail, o.cwd, o.created_at
         FROM observations o WHERE o.session_id = ?
-        ORDER BY o.created_at ASC LIMIT 200
+        ORDER BY o.created_at ASC LIMIT ${LEVEL_LIMITS[3].observations}
       `).all(activeSessionId);
     } else {
-      const obsLimit = level === 3 ? 10 : 5;
+      const obsLimit = LEVEL_LIMITS[level]?.observations || LEVEL_LIMITS[2].observations;
       observations = db.prepare(`
         SELECT o.id, o.tool_name, o.action, o.files, o.detail, o.cwd, o.created_at
         FROM observations o WHERE o.cwd = ?
@@ -733,7 +734,7 @@ export function getRecentContext(cwd, opts = {}) {
     }
 
     // Thinking blocks: FTS5 selection (F10) con fallback reciente
-    const thinkingLimit = level === 3 ? 5 : 3;
+    const thinkingLimit = LEVEL_LIMITS[level]?.thinking || LEVEL_LIMITS[2].thinking;
     const thinkingSessionId = (level === 3 && activeSessionId) ? activeSessionId : null;
     const thinkingRows = getKeyThinking(nCwd, thinkingSessionId, thinkingLimit);
     const thinking = thinkingRows.length > 0 ? thinkingRows : null;
@@ -751,12 +752,12 @@ export function getRecentContext(cwd, opts = {}) {
         )
         SELECT * FROM scored
         ORDER BY composite_score DESC
-        LIMIT 30
+        LIMIT ${SCORING.SAMPLE_SIZE}
       `).all(nCwd);
       const threshold = getThreshold(allScored.map(r => r.composite_score));
       topScored = allScored.filter(r => r.composite_score >= threshold);
-      if (topScored.length < 5 && allScored.length >= 5) {
-        topScored = allScored.slice(0, 5);
+      if (topScored.length < SCORING.MIN_SCORED_FALLBACK && allScored.length >= SCORING.MIN_SCORED_FALLBACK) {
+        topScored = allScored.slice(0, SCORING.MIN_SCORED_FALLBACK);
       }
       topScored = topScored.slice(0, topLimit);
     }
@@ -767,10 +768,10 @@ export function getRecentContext(cwd, opts = {}) {
       prompts = db.prepare(`
         SELECT p.prompt_text, p.created_at
         FROM user_prompts p WHERE p.session_id = ?
-        ORDER BY p.created_at ASC LIMIT 50
+        ORDER BY p.created_at ASC LIMIT ${LEVEL_LIMITS[3].prompts}
       `).all(activeSessionId);
     } else {
-      const promptLimit = 5;
+      const promptLimit = LEVEL_LIMITS[2].prompts;
       prompts = db.prepare(`
         SELECT p.prompt_text, p.created_at
         FROM user_prompts p
@@ -781,7 +782,7 @@ export function getRecentContext(cwd, opts = {}) {
     }
 
     // Sesiones index: nivel 2 = 3, nivel 3 = 1
-    const sessionIndexLimit = level === 3 ? 1 : 3;
+    const sessionIndexLimit = LEVEL_LIMITS[level]?.recentSessions || LEVEL_LIMITS[2].recentSessions;
     const recentSessions = db.prepare(`
       SELECT s.session_id, s.project, s.started_at, s.completed_at, s.status,
              s.observation_count, s.prompt_count,
@@ -864,7 +865,7 @@ function queryPrevHighImpactActions(db, nCwd) {
     LEFT JOIN observation_scores s ON s.observation_id = o.id
     WHERE o.tool_name IN ('Edit', 'Write', 'Bash')
     ORDER BY s.composite_score DESC
-    LIMIT 5
+    LIMIT ${SCORING.PREV_HIGH_IMPACT_LIMIT}
   `).all(nCwd);
 }
 
@@ -1088,7 +1089,7 @@ export function forgetRecords(type, ids, cwd) {
 export function getCleanupTargets(cwd, olderThanDays) {
   const db = getDb();
   const nCwd = normalizeCwd(cwd);
-  const cutoff = olderThanDays * 86400;
+  const cutoff = olderThanDays * TIME.SECONDS_PER_DAY;
   try {
     const obs = db.prepare(`
       SELECT COUNT(*) as count FROM observations
@@ -1136,7 +1137,7 @@ export function getCleanupTargets(cwd, olderThanDays) {
 export function executeCleanup(cwd, olderThanDays) {
   const db = getDb();
   const nCwd = normalizeCwd(cwd);
-  const cutoff = olderThanDays * 86400;
+  const cutoff = olderThanDays * TIME.SECONDS_PER_DAY;
   let totalDeleted = 0;
   let obsDeleted = 0, promptsDeleted = 0, snapshotsDeleted = 0, summariesDeleted = 0, turnLogsDeleted = 0;
   try {
@@ -1186,7 +1187,7 @@ export function executeCleanup(cwd, olderThanDays) {
     }
 
     totalDeleted = obsDeleted + promptsDeleted + snapshotsDeleted + summariesDeleted + turnLogsDeleted;
-    if (totalDeleted > 100) {
+    if (totalDeleted > DB.VACUUM_THRESHOLD) {
       db.exec('VACUUM');
     }
 
@@ -1197,7 +1198,7 @@ export function executeCleanup(cwd, olderThanDays) {
       summaries: summariesDeleted,
       turnLogs: turnLogsDeleted,
       total: totalDeleted,
-      vacuumed: totalDeleted > 100
+      vacuumed: totalDeleted > DB.VACUUM_THRESHOLD
     };
   } finally {
     db.close();

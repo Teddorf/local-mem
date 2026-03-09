@@ -1,6 +1,8 @@
-const MAX_STDIN_SIZE = 1_048_576;
+import { SIZES, TIMEOUTS } from './constants.mjs';
 
-export async function readStdin(timeoutMs = 3000) {
+const MAX_STDIN_SIZE = SIZES.MAX_STDIN_BYTES;
+
+export async function readStdin(timeoutMs = TIMEOUTS.STDIN_DEFAULT) {
   return new Promise((resolve) => {
     if (process.stdin.isTTY) return resolve({});
     process.stdin.setEncoding('utf8');

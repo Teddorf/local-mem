@@ -12,6 +12,7 @@ import {
 } from './db.mjs';
 import { sanitizeXml, truncate, redact } from './redact.mjs';
 import { parseJsonSafe, formatTime as formatHour, CONFIDENCE_LABELS } from './shared.mjs';
+import { SIZES, TIMEOUTS, TRUNCATE, RENDER, LEVEL_LIMITS, TIME, URLS } from './constants.mjs';
 
 async function checkForUpdate() {
   try {
@@ -20,12 +21,12 @@ async function checkForUpdate() {
     if (!localVersion) return null;
 
     const resp = await fetch(
-      'https://raw.githubusercontent.com/Teddorf/local-mem/main/package.json',
-      { signal: AbortSignal.timeout(3000) }
+      URLS.GITHUB_PACKAGE_JSON,
+      { signal: AbortSignal.timeout(TIMEOUTS.FETCH_UPDATE) }
     );
     if (!resp.ok) return null;
     const remote = await resp.json();
-    if (typeof remote.version === 'string' && remote.version.length < 30 && remote.version !== localVersion) {
+    if (typeof remote.version === 'string' && remote.version.length < RENDER.MAX_VERSION_STRING && remote.version !== localVersion) {
       return { local: localVersion, remote: remote.version };
     }
     return null;
@@ -38,12 +39,12 @@ function formatRelativeTime(epochSeconds) {
   if (!epochSeconds) return '';
   const diffMs = Date.now() - epochSeconds * 1000;
   const diffSec = Math.floor(diffMs / 1000);
-  if (diffSec < 60) return 'ahora';
-  const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `hace ${diffMin}m`;
-  const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `hace ${diffHr}h`;
-  const diffDays = Math.floor(diffHr / 24);
+  if (diffSec < TIME.SECONDS_PER_MINUTE) return 'ahora';
+  const diffMin = Math.floor(diffSec / TIME.SECONDS_PER_MINUTE);
+  if (diffMin < TIME.SECONDS_PER_MINUTE) return `hace ${diffMin}m`;
+  const diffHr = Math.floor(diffMin / TIME.SECONDS_PER_MINUTE);
+  if (diffHr < (TIME.SECONDS_PER_DAY / TIME.SECONDS_PER_HOUR)) return `hace ${diffHr}h`;
+  const diffDays = Math.floor(diffHr / (TIME.SECONDS_PER_DAY / TIME.SECONDS_PER_HOUR));
   return `hace ${diffDays}d`;
 }
 
@@ -71,7 +72,7 @@ function renderCrossSession(lines, prevData, prevActions) {
 
   // 1. Que quedo pendiente (lo MAS importante)
   if (prevData.next_action) {
-    lines.push(`- Pendiente: ${sanitizeXml(truncate(prevData.next_action, 200))}`);
+    lines.push(`- Pendiente: ${sanitizeXml(truncate(prevData.next_action, TRUNCATE.CROSS_SESSION_ACTION))}`);
   }
 
   // 2. Decisiones abiertas
@@ -108,7 +109,7 @@ function renderCrossSession(lines, prevData, prevActions) {
   if (prevActions && prevActions.length > 0) {
     const fileSet = new Set();
     for (const a of prevActions) {
-      const desc = sanitizeXml(truncate(a.action, 80));
+      const desc = sanitizeXml(truncate(a.action, TRUNCATE.CROSS_SESSION_FILE));
       lines.push(`- ${a.tool_name}: ${desc}`);
       if (a.files) {
         const files = parseJsonSafe(a.files);
@@ -116,19 +117,19 @@ function renderCrossSession(lines, prevData, prevActions) {
       }
     }
     if (fileSet.size > 0) {
-      const shown = [...fileSet].slice(0, 5).map(f => sanitizeXml(String(f))).join(', ');
+      const shown = [...fileSet].slice(0, RENDER.MAX_FILES_CROSS_SESSION).map(f => sanitizeXml(String(f))).join(', ');
       lines.push(`- Archivos tocados: ${shown}`);
     }
   }
 
   // 7. Ultimo razonamiento
   if (prevData.last_thinking) {
-    lines.push(`- Ultimo razonamiento: ${sanitizeXml(truncate(prevData.last_thinking, 300))}`);
+    lines.push(`- Ultimo razonamiento: ${sanitizeXml(truncate(prevData.last_thinking, TRUNCATE.CROSS_SESSION_RESULT))}`);
   }
 
   // 8. Ultimo pedido del usuario
   if (prevData.last_prompt) {
-    lines.push(`- Ultimo pedido: "${sanitizeXml(truncate(prevData.last_prompt, 120))}"`);
+    lines.push(`- Ultimo pedido: "${sanitizeXml(truncate(prevData.last_prompt, TRUNCATE.CROSS_SESSION_PENDING))}"`);
   }
 }
 
@@ -143,11 +144,11 @@ function checkContextValidity(snapshot, cwd) {
   const sinceDate = new Date(snapshotEpoch * 1000).toISOString();
   const changed = [];
 
-  for (const file of files.slice(0, 10)) {
+  for (const file of files.slice(0, RENDER.MAX_FILES_CHECK_GIT)) {
     try {
       const stdout = execFileSync('git', [
         'log', '--oneline', `--since=${sinceDate}`, '--', file
-      ], { cwd, timeout: 5000, encoding: 'utf8' });
+      ], { cwd, timeout: TIMEOUTS.GIT_COMMAND, encoding: 'utf8' });
       const commits = stdout.trim().split('\n').filter(Boolean);
       if (commits.length > 0) {
         changed.push({ file, commits: commits.length });
@@ -196,15 +197,15 @@ export function renderGroupedObservations(lines, observations, maxLines) {
   // 1. Archivos editados primero (más importantes)
   for (const [file, edits] of editGroups) {
     if (rendered >= maxLines) break;
-    const fileName = sanitizeXml(truncate(file, 80));
+    const fileName = sanitizeXml(truncate(file, TRUNCATE.OBS_FILE));
     if (edits.length === 1) {
       const e = edits[0];
       let line = `- #${e.id ?? ''} ${fileName}`;
-      if (e.detail) line += `: ${sanitizeXml(truncate(e.detail, 80))}`;
+      if (e.detail) line += `: ${sanitizeXml(truncate(e.detail, TRUNCATE.OBS_DETAIL))}`;
       lines.push(line);
     } else {
-      const details = edits.slice(0, 5).map(e => sanitizeXml(truncate(e.detail || e.action || '', 60))).join('; ');
-      lines.push(`- ${fileName} (${edits.length} edits): ${truncate(details, 200)}`);
+      const details = edits.slice(0, 5).map(e => sanitizeXml(truncate(e.detail || e.action || '', TRUNCATE.OBS_GROUPED_DETAIL))).join('; ');
+      lines.push(`- ${fileName} (${edits.length} edits): ${truncate(details, TRUNCATE.OBS_GROUPED_LINE)}`);
     }
     rendered++;
   }
@@ -212,7 +213,7 @@ export function renderGroupedObservations(lines, observations, maxLines) {
   // 2. Reads agrupados
   for (const [file, count] of readGroups) {
     if (rendered >= maxLines) break;
-    const fileName = sanitizeXml(truncate(file, 80));
+    const fileName = sanitizeXml(truncate(file, TRUNCATE.OBS_FILE));
     if (count === 1) {
       lines.push(`- Leyó ${fileName}`);
     } else {
@@ -226,9 +227,9 @@ export function renderGroupedObservations(lines, observations, maxLines) {
     if (rendered >= maxLines) break;
     const num = obs.id ?? '';
     const hora = sanitizeXml(formatHour(obs.created_at));
-    let accion = sanitizeXml(truncate(obs.action || '', 100));
+    let accion = sanitizeXml(truncate(obs.action || '', TRUNCATE.OBS_ACTION));
     if (obs.detail) {
-      accion = `${accion}: ${sanitizeXml(truncate(obs.detail, 80))}`;
+      accion = `${accion}: ${sanitizeXml(truncate(obs.detail, TRUNCATE.OBS_DETAIL))}`;
     }
     lines.push(`- #${num} ${hora} ${accion}`);
     rendered++;
@@ -267,7 +268,7 @@ function buildHistoricalContext(project, ctx, source, level) {
     if (level === 1) {
       // Solo resultado (1-liner)
       if (summary.summary_text) {
-        lines.push(`- Resultado: ${sanitizeXml(truncate(summary.summary_text, 150))}`);
+        lines.push(`- Resultado: ${sanitizeXml(truncate(summary.summary_text, TRUNCATE.SUMMARY_RESULT))}`);
       }
     } else {
       // Nivel 2/3: completo (tools, archivos, resultado)
@@ -289,7 +290,7 @@ function buildHistoricalContext(project, ctx, source, level) {
       }
       const statParts = [];
       if (summary.duration_seconds) {
-        const mins = Math.round(summary.duration_seconds / 60);
+        const mins = Math.round(summary.duration_seconds / TIME.SECONDS_PER_MINUTE);
         statParts.push(`${mins} min`);
       }
       if (summary.observation_count) {
@@ -311,13 +312,13 @@ function buildHistoricalContext(project, ctx, source, level) {
         }
       }
       if (allFiles.length > 0) {
-        const shown = allFiles.slice(0, 3).map(f => sanitizeXml(String(f))).join(', ');
-        const extra = allFiles.length > 3 ? ` (+${allFiles.length - 3} mas)` : '';
+        const shown = allFiles.slice(0, RENDER.MAX_SUMMARY_FILES).map(f => sanitizeXml(String(f))).join(', ');
+        const extra = allFiles.length > RENDER.MAX_SUMMARY_FILES ? ` (+${allFiles.length - RENDER.MAX_SUMMARY_FILES} mas)` : '';
         lines.push(`- Archivos: ${shown}${extra}`);
       }
 
       if (summary.summary_text) {
-        lines.push(`- Resultado: ${sanitizeXml(truncate(summary.summary_text, 200))}`);
+        lines.push(`- Resultado: ${sanitizeXml(truncate(summary.summary_text, TRUNCATE.SUMMARY_FILE))}`);
       }
     }
   }
@@ -348,17 +349,17 @@ function buildHistoricalContext(project, ctx, source, level) {
       const plan = parseJsonSafe(snapshot.plan);
       if (plan) {
         if (Array.isArray(plan)) {
-          const items = plan.slice(0, 10).map((p, i) => `${i + 1}. ${sanitizeXml(String(p))}`).join('; ');
-          lines.push(`- Plan: ${truncate(items, 300)}`);
+          const items = plan.slice(0, RENDER.MAX_PLAN_ITEMS).map((p, i) => `${i + 1}. ${sanitizeXml(String(p))}`).join('; ');
+          lines.push(`- Plan: ${truncate(items, TRUNCATE.PLAN_TEXT)}`);
         } else {
           const planStr = typeof plan === 'string' ? plan : JSON.stringify(plan);
-          lines.push(`- Plan: ${sanitizeXml(truncate(planStr, 300))}`);
+          lines.push(`- Plan: ${sanitizeXml(truncate(planStr, TRUNCATE.PLAN_TEXT))}`);
         }
       }
       const pendingTasks = parseJsonSafe(snapshot.pending_tasks);
       if (Array.isArray(pendingTasks) && pendingTasks.length > 0) {
-        const joined = pendingTasks.slice(0, 10).map(t => sanitizeXml(String(t))).join('; ');
-        lines.push(`- Tareas pendientes: ${truncate(joined, 500)}`);
+        const joined = pendingTasks.slice(0, RENDER.MAX_PENDING_TASKS).map(t => sanitizeXml(String(t))).join('; ');
+        lines.push(`- Tareas pendientes: ${truncate(joined, TRUNCATE.PENDING_TASKS)}`);
       }
       const decisions = parseJsonSafe(snapshot.open_decisions);
       if (Array.isArray(decisions) && decisions.length > 0) {
@@ -376,7 +377,7 @@ function buildHistoricalContext(project, ctx, source, level) {
     } else {
       // Level 1: solo tarea + paso
       if (snapshot.execution_point) {
-        lines.push(`- Paso: ${sanitizeXml(truncate(snapshot.execution_point, 100))}`);
+        lines.push(`- Paso: ${sanitizeXml(truncate(snapshot.execution_point, TRUNCATE.EXECUTION_POINT_L1))}`);
       }
     }
   }
@@ -403,10 +404,10 @@ function buildHistoricalContext(project, ctx, source, level) {
     for (const t of thinking) {
       const hora = sanitizeXml(formatHour(t.created_at));
       if (t.thinking_text) {
-        lines.push(`- [${hora}] ${sanitizeXml(truncate(t.thinking_text, 500))}`);
+        lines.push(`- [${hora}] ${sanitizeXml(truncate(t.thinking_text, TRUNCATE.THINKING_TEXT))}`);
       }
       if (level === 3 && t.response_text) {
-        lines.push(`- [${hora}] Respondió: ${sanitizeXml(truncate(t.response_text, 300))}`);
+        lines.push(`- [${hora}] Respondió: ${sanitizeXml(truncate(t.response_text, TRUNCATE.RESPONSE_TEXT))}`);
       }
     }
   }
@@ -417,7 +418,7 @@ function buildHistoricalContext(project, ctx, source, level) {
     lines.push(level === 1 ? `## Ultimo pedido` : `## Ultimos pedidos del usuario`);
     for (const p of prompts) {
       const hora = sanitizeXml(formatHour(p.created_at));
-      const text = sanitizeXml(truncate(p.prompt_text || '', 120));
+      const text = sanitizeXml(truncate(p.prompt_text || '', TRUNCATE.PROMPT_TEXT));
       lines.push(`- [${hora}] "${text}"`);
     }
   }
@@ -428,27 +429,27 @@ function buildHistoricalContext(project, ctx, source, level) {
       // Nivel 3 (compact): TODAS las obs agrupadas
       lines.push(``);
       lines.push(`## Actividad de esta sesión`);
-      renderGroupedObservations(lines, observations, 30);
+      renderGroupedObservations(lines, observations, LEVEL_LIMITS[3].maxObsLines);
     } else {
       // Nivel 2 (startup): top scored con detail, fallback a obs cronológicas
       lines.push(``);
       if (topScored && topScored.length > 0) {
         lines.push(`## Actividad relevante`);
-        for (const obs of topScored.slice(0, 7)) {
+        for (const obs of topScored.slice(0, LEVEL_LIMITS[2].topScored)) {
           const num = obs.id ?? '';
           const hora = sanitizeXml(formatHour(obs.created_at));
-          const accion = sanitizeXml(truncate(obs.action || '', 80));
+          const accion = sanitizeXml(truncate(obs.action || '', TRUNCATE.OBS_SCORED_ACTION));
           const score = obs.composite_score != null ? Number(obs.composite_score).toFixed(2) : '';
           lines.push(`- #${num} ${hora} ${accion} [${score}]`);
         }
       } else if (observations && observations.length > 0) {
-        lines.push(`## Ultimas ${Math.min(observations.length, 5)} acciones`);
-        for (const obs of observations.slice(0, 5)) {
+        lines.push(`## Ultimas ${Math.min(observations.length, LEVEL_LIMITS[2].observations)} acciones`);
+        for (const obs of observations.slice(0, LEVEL_LIMITS[2].observations)) {
           const num = obs.id ?? '';
           const hora = sanitizeXml(formatHour(obs.created_at));
-          let accion = sanitizeXml(truncate(obs.action || '', 100));
+          let accion = sanitizeXml(truncate(obs.action || '', TRUNCATE.OBS_ACTION));
           if (obs.detail) {
-            accion = `${accion}: ${sanitizeXml(truncate(obs.detail, 100))}`;
+            accion = `${accion}: ${sanitizeXml(truncate(obs.detail, TRUNCATE.OBS_ACTION))}`;
           }
           lines.push(`- #${num} ${hora} ${accion}`);
         }
@@ -457,7 +458,7 @@ function buildHistoricalContext(project, ctx, source, level) {
   }
 
   // --- Indice de sesiones recientes (nivel 2+) ---
-  const maxSessions = level === 3 ? 1 : 3;
+  const maxSessions = level === 3 ? LEVEL_LIMITS[3].recentSessions : LEVEL_LIMITS[2].recentSessions;
   if (level >= 2 && recentSessions && recentSessions.length > 0) {
     lines.push(``);
     lines.push(`## Indice de sesiones recientes`);
@@ -466,7 +467,7 @@ function buildHistoricalContext(project, ctx, source, level) {
     lines.push(`|--------|-------|-----|----------------|`);
 
     for (const sess of recentSessions.slice(0, maxSessions)) {
-      const sesId = sanitizeXml(String(sess.session_id || sess.id || '').slice(0, 8));
+      const sesId = sanitizeXml(String(sess.session_id || sess.id || '').slice(0, RENDER.SESSION_ID_DISPLAY_LEN));
       const fecha = sanitizeXml(formatRelativeTime(sess.started_at));
       const obsCount = sess.observation_count ?? sess.obs_count ?? '';
       let keyFiles = '';
@@ -483,8 +484,8 @@ function buildHistoricalContext(project, ctx, source, level) {
           }
         }
         if (sf.length > 0) {
-          keyFiles = sf.slice(0, 2).map(f => sanitizeXml(String(f))).join(', ');
-          if (sf.length > 2) keyFiles += ` +${sf.length - 2}`;
+          keyFiles = sf.slice(0, RENDER.MAX_KEY_FILES_INDEX).map(f => sanitizeXml(String(f))).join(', ');
+          if (sf.length > RENDER.MAX_KEY_FILES_INDEX) keyFiles += ` +${sf.length - RENDER.MAX_KEY_FILES_INDEX}`;
         }
       }
       lines.push(`| ${sesId} | ${fecha} | ${obsCount} | ${keyFiles} |`);
@@ -497,8 +498,8 @@ function buildHistoricalContext(project, ctx, source, level) {
   return lines.join('\n');
 }
 
-const LAST_500KB = 500 * 1024;
-const LAST_2MB = 2 * 1024 * 1024;
+const LAST_500KB = SIZES.TRANSCRIPT_LAST_500KB;
+const LAST_2MB = SIZES.TRANSCRIPT_LAST_2MB;
 
 /**
  * Find a transcript JSONL file for this project.
@@ -527,7 +528,7 @@ function findTranscript(currentSessionId, projectCwd, opts = {}) {
     if (!targetProjDir) {
       for (const projDir of readdirSync(claudeDir, { withFileTypes: true })) {
         if (!projDir.isDirectory()) continue;
-        if (projDir.name.toLowerCase().endsWith(expectedDirName.slice(-60))) {
+        if (projDir.name.toLowerCase().endsWith(expectedDirName.slice(-RENDER.PROJECT_DIR_SLICE))) {
           targetProjDir = join(claudeDir, projDir.name);
           break;
         }
@@ -565,7 +566,7 @@ function findTranscript(currentSessionId, projectCwd, opts = {}) {
  * Extract last N thinking blocks from a transcript JSONL file.
  * Returns array of { thinking_text, response_text } objects.
  */
-function extractThinkingFromTranscript(transcriptPath, count = 5, maxBytes = LAST_500KB) {
+function extractThinkingFromTranscript(transcriptPath, count = RENDER.THINKING_BLOCKS_DEFAULT, maxBytes = LAST_500KB) {
   try {
     let buf;
     try { buf = readFileSync(transcriptPath); } catch { return []; }
@@ -630,7 +631,7 @@ async function main() {
 
   const updatePromise = checkForUpdate();
 
-  abandonOrphanSessions(cwd, 4);
+  abandonOrphanSessions(cwd, TIME.ORPHAN_SESSION_HOURS);
   ensureSession(sessionId, project, cwd);
 
   // Fase 2: On compact, capture thinking from previous transcript
@@ -639,7 +640,7 @@ async function main() {
     try {
       const prevTranscript = findTranscript(sessionId, cwd, { includeCurrent: true });
       if (prevTranscript) {
-        compactThinking = extractThinkingFromTranscript(prevTranscript, 5, LAST_2MB);
+        compactThinking = extractThinkingFromTranscript(prevTranscript, RENDER.THINKING_BLOCKS_DEFAULT, LAST_2MB);
         // Save to turn_log for persistence
         for (let i = 0; i < compactThinking.length; i++) {
           try {
@@ -673,7 +674,7 @@ async function main() {
     const thinkingLines = ['\n## Razonamiento pre-compact (capturado del transcript)'];
     for (const t of compactThinking) {
       if (t.thinking_text) {
-        thinkingLines.push(`- ${sanitizeXml(truncate(t.thinking_text, 500))}`);
+        thinkingLines.push(`- ${sanitizeXml(truncate(t.thinking_text, TRUNCATE.THINKING_TEXT))}`);
       }
     }
     markdown = markdown.replace('</local-mem-data>', thinkingLines.join('\n') + '\n</local-mem-data>');

@@ -1,6 +1,7 @@
 import { mkdirSync, existsSync, readFileSync, writeFileSync, renameSync, chmodSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { execSync } from 'node:child_process';
+import { DB, TIMEOUTS, PATTERNS, MIN_BUN_VERSION } from './scripts/constants.mjs';
 
 const HOME = process.env.HOME || process.env.USERPROFILE;
 const SETTINGS_PATH = join(HOME, '.claude', 'settings.json');
@@ -9,11 +10,9 @@ const BUN_PATH = process.execPath;
 const PROJECT_PATH = import.meta.dirname;
 const IS_WIN = process.platform === 'win32';
 
-// Cloud sync detection
-const CLOUD_PATTERNS = ['OneDrive', 'Dropbox', 'iCloudDrive', 'Google Drive', 'Nextcloud'];
-
 function isCloudPath(p) {
-  return CLOUD_PATTERNS.some(pat => p.includes(pat));
+  const lower = p.toLowerCase();
+  return PATTERNS.CLOUD_SYNC_DIRS.some(pat => lower.includes(pat));
 }
 
 // Bun version check
@@ -26,7 +25,7 @@ function checkBun() {
       process.exit(1);
     }
     const [, major, minor] = match.map(Number);
-    if (major < 1 || (major === 1 && minor < 1)) {
+    if (major < MIN_BUN_VERSION.major || (major === MIN_BUN_VERSION.major && minor < MIN_BUN_VERSION.minor)) {
       console.error(`ERROR: Bun >= 1.1.0 requerido. Version actual: ${out}`);
       process.exit(1);
     }
@@ -42,13 +41,13 @@ function checkBun() {
 function setupDataDir() {
   mkdirSync(DATA_DIR, { recursive: true });
   if (!IS_WIN) {
-    chmodSync(DATA_DIR, 0o700);
+    chmodSync(DATA_DIR, DB.PERMISSIONS_DIR);
     // chmod 600 on any existing db files
     try {
       const files = readdirSync(DATA_DIR);
       for (const f of files) {
         if (f.includes('.db')) {
-          chmodSync(join(DATA_DIR, f), 0o600);
+          chmodSync(join(DATA_DIR, f), DB.PERMISSIONS_FILE);
         }
       }
     } catch {}
@@ -76,14 +75,14 @@ function buildHookConfig() {
       hooks: [{
         type: 'command',
         command: `${b} ${scriptPath('session-start.mjs')}`,
-        timeout: 10
+        timeout: TIMEOUTS.HOOK_FAST
       }]
     },
     UserPromptSubmit: {
       hooks: [{
         type: 'command',
         command: `${b} ${scriptPath('prompt-submit.mjs')}`,
-        timeout: 10
+        timeout: TIMEOUTS.HOOK_FAST
       }]
     },
     PostToolUse: {
@@ -91,14 +90,14 @@ function buildHookConfig() {
       hooks: [{
         type: 'command',
         command: `${b} ${scriptPath('observation.mjs')}`,
-        timeout: 10
+        timeout: TIMEOUTS.HOOK_FAST
       }]
     },
     SessionEnd: {
       hooks: [{
         type: 'command',
         command: `${b} ${scriptPath('session-end.mjs')}`,
-        timeout: 20
+        timeout: TIMEOUTS.HOOK_SLOW
       }]
     }
   };
@@ -132,7 +131,7 @@ function mergeHooks(settings, hookConfig) {
 function registerMcp() {
   try {
     // Check if already registered
-    const existing = execSync('claude mcp list 2>&1', { encoding: 'utf8', timeout: 10000 });
+    const existing = execSync('claude mcp list 2>&1', { encoding: 'utf8', timeout: TIMEOUTS.CLI_COMMAND });
     if (existing.includes('local-mem')) {
       console.log('  [SKIP] MCP server local-mem ya registrado.');
       return false;
@@ -144,7 +143,7 @@ function registerMcp() {
   try {
     const serverPath = join(PROJECT_PATH, 'mcp', 'server.mjs');
     const cmd = `claude mcp add --scope user local-mem "${BUN_PATH}" "${serverPath}"`;
-    execSync(cmd, { encoding: 'utf8', timeout: 15000 });
+    execSync(cmd, { encoding: 'utf8', timeout: TIMEOUTS.MCP_REGISTRATION });
     return true;
   } catch (e) {
     // Fallback: write to settings.json mcpServers for backwards compat
@@ -208,7 +207,7 @@ async function main() {
   console.log(`[OK] Backup creado: ${backupPath}`);
 
   // 6. Detect other memory plugins
-  const memoryIndicators = ['claude-mem', 'memory-plugin', 'persistent-memory', 'cline-memory'];
+  const memoryIndicators = PATTERNS.OTHER_MEMORY_PLUGINS;
   const allHookCommands = Object.values(settings.hooks || {})
     .flat()
     .flatMap(entry => (entry.hooks || []).map(h => h.command || ''));

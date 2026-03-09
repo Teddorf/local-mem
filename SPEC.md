@@ -27,7 +27,12 @@
 17. [Deuda técnica conocida](#deuda-tecnica-conocida-v01--v06) — Limitaciones actuales
 18. [Plan de implementación v0.6.0](#plan-de-implementacion-v060) — Grafo de dependencias, fases
 19. [Plan de implementación v0.8.0](#plan-de-implementacion-v080) — Inyección semántica, 10 fixes, 3 batches
-20. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
+20. [Plan de implementación v0.9.0](#plan-de-implementacion-v090--project-dna) — Project DNA, auto-detect, 5 agentes
+21. [Plan de implementación v0.10.0](#plan-de-implementacion-v0100--resumen-con-ia) — Resumen con IA, API Haiku, 4 agentes
+22. [Plan de implementación v0.11.0](#plan-de-implementacion-v0110--budget-aware-rendering) — Budget-aware, BudgetRenderer, 3 agentes
+23. [Datos no aprovechados](#datos-disponibles-no-aprovechados-oportunidad-cross-version) — Quick wins con datos existentes
+24. [Resumen de agentes por versión](#resumen-de-agentes-por-version) — 12 agentes, 9 batches
+25. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
 
 ---
 
@@ -2619,6 +2624,432 @@ Documentada para transparencia:
 - **Project DNA**: Tabla `project_profile` con stack, patrones, key_files detectados cross-sesión. ~50-80 tokens fijos que ahorran cientos en cada sesión.
 - **Budget-aware rendering**: Token budget configurable. Secciones llenan de mayor a menor prioridad hasta agotar budget.
 - **Resumen con IA (opt-in)**: En session-end, usar el propio Claude para generar resumen semántico de 2-3 frases.
+
+---
+
+## Plan de implementación v0.9.0 — Project DNA
+
+### Problema
+
+Cada sesión nueva Claude "redescubre" el proyecto: qué stack usa, qué patrones sigue, cuáles son los archivos clave. Esto cuesta 200-500 tokens de descubrimiento repetitivo. Project DNA inyecta ~50-80 tokens fijos que eliminan ese overhead en TODAS las sesiones.
+
+### Schema: tabla `project_profile` (migración v5)
+
+```sql
+CREATE TABLE IF NOT EXISTS project_profile (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cwd TEXT UNIQUE NOT NULL,
+  stack TEXT,           -- JSON array: ["bun","sqlite","mcp","esm"]
+  patterns TEXT,        -- JSON array: ["zero-deps","FTS5","hooks"]
+  key_files TEXT,       -- JSON array: ["db.mjs","server.mjs","session-start.mjs"]
+  conventions TEXT,     -- Free text: "español, conciso, bun test"
+  updated_at INTEGER NOT NULL,
+  source TEXT CHECK(source IN ('auto','manual')) DEFAULT 'auto'
+);
+```
+
+### Flujo de datos
+
+```
+┌─────────────┐    ┌──────────────────┐    ┌───────────────────┐
+│ SessionEnd   │───▶│ updateProjectDna │───▶│ project_profile   │
+│ (auto-learn) │    │ inferir de       │    │ tabla en SQLite   │
+│              │    │ tools + files    │    │                   │
+└─────────────┘    └──────────────────┘    └───────┬───────────┘
+                                                    │
+┌─────────────┐    ┌──────────────────┐             │
+│ SessionStart │◀───│ getProjectDna()  │◀────────────┘
+│ (render)     │    │ inyectar header  │
+└─────────────┘    └──────────────────┘
+
+MCP tool "project_dna" ──▶ Edición manual (source='manual', no sobreescribible)
+```
+
+### Heurísticas de auto-detección (en session-end)
+
+| Signal | Stack detectado |
+|--------|----------------|
+| files_modified contiene `*.ts` | TypeScript |
+| files_modified contiene `*.mjs` o `*.js` con `"type":"module"` | ESM |
+| tools_used contiene Bash con `bun test` | Bun |
+| tools_used contiene Bash con `npm`/`yarn`/`pnpm` | Node.js + package manager |
+| files_modified contiene `*.py` | Python |
+| files_modified contiene `*.rs` | Rust |
+| files_modified contiene `*.go` | Go |
+| package.json engines contiene `bun` | Bun (confirmado) |
+| Bash actions contienen `docker` | Docker |
+| files_modified contiene `*.sql` o importa `sqlite` | SQLite |
+
+### Rendering en session-start (después del header)
+
+```
+# proyecto — contexto reciente (nivel X)
+
+DNA: Bun + SQLite + ESM | zero-deps, FTS5, hooks | Key: db.mjs, server.mjs
+```
+
+- Solo si level >= 2 (no se inyecta en nivel 1 clear)
+- ~50-80 tokens fijos
+- source="manual" tiene prioridad sobre "auto" y nunca se sobreescribe automáticamente
+
+### Archivos a modificar
+
+| Archivo | Cambio | Complejidad |
+|---------|--------|-------------|
+| `scripts/db.mjs` | Migración v5, `getProjectDna()`, `updateProjectDna()`, `setProjectDna()` | M |
+| `scripts/session-end.mjs` | Llamar `updateProjectDna()` con heurísticas | M |
+| `scripts/session-start.mjs` | Inyectar DNA en header (línea ~258) | S |
+| `mcp/server.mjs` | Tool `project_dna` (get/set manual) | S |
+| `tests/v090.test.mjs` | Tests unitarios para DNA | M |
+
+### Dependencias entre tareas
+
+```
+┌─────────────────────┐
+│ T1: Schema + DB API  │──────┐
+│ (db.mjs)             │      │
+└─────────────────────┘      │
+                              ▼
+┌─────────────────────┐  ┌────────────────────┐
+│ T2: Auto-detect      │  │ T3: Rendering      │
+│ (session-end.mjs)    │  │ (session-start.mjs)│
+└─────────────────────┘  └────────────────────┘
+                              │
+┌─────────────────────┐      │
+│ T4: MCP tool         │      │ (independiente de T2)
+│ (server.mjs)         │◀─────┘
+└─────────────────────┘
+
+┌─────────────────────┐
+│ T5: Tests            │ (después de T1-T4)
+│ (tests/v090.test.mjs)│
+└─────────────────────┘
+```
+
+- **T1 es bloqueante** (todos dependen de la tabla y API)
+- **T2, T3, T4 son parallelizables** (archivos distintos, sin conflicto)
+- **T5 es secuencial** (necesita todo implementado)
+
+### Ejecución — Asignación de agentes
+
+**Batch 1: T1 (secuencial, 1 agente)**
+
+| Agente | Rol | Archivo | Cambios |
+|--------|-----|---------|---------|
+| A1: DB Architect | Schema + queries SQLite | `db.mjs` | Migración v5, `getProjectDna()`, `updateProjectDna()`, `setProjectDna()` |
+
+**Batch 2: T2 + T3 + T4 (paralelo, 3 agentes)**
+
+| Agente | Rol | Archivo | Cambios |
+|--------|-----|---------|---------|
+| A2: Heuristics Engineer | Inferencia de stack/patterns | `session-end.mjs` | `inferProjectDna()`, llamada en `main()` post-complete |
+| A3: Rendering Specialist | Inyección visual | `session-start.mjs` | Render DNA en header, consulta `getProjectDna()` |
+| A4: MCP Protocol Expert | Tool nueva | `server.mjs` | Tool `project_dna` con get/set, validación |
+
+**Batch 3: T5 (secuencial, 1 agente review + tests)**
+
+| Agente | Rol | Archivo | Cambios |
+|--------|-----|---------|---------|
+| A5: Test Architect | Tests + integración | `tests/v090.test.mjs` | Tests unitarios + verificación cross-file |
+
+### Edge cases documentados
+
+- **Stack incorrecto**: auto-detect marca "React" cuando migró a Svelte → `updated_at` permite invalidar (>30 días stale)
+- **source="manual" protegido**: nunca sobreescribible por auto-detect
+- **Monorepo**: múltiples cwds → cada uno tiene su propio DNA (cwd es UNIQUE)
+- **Proyecto nuevo (sin DNA)**: no inyectar nada, esperar primera sesión completa
+- **Merge de auto-detecciones**: cada sesión AGREGA al stack, no reemplaza (union de sets)
+
+### Criterio de aceptación
+
+- Después de 1 sesión, `project_profile` tiene al menos stack detectado
+- DNA se inyecta en nivel 2 y 3, NO en nivel 1
+- Tool MCP `project_dna` permite get y set manual
+- `source='manual'` nunca se sobreescribe por auto-detect
+- Tests pasan para: auto-detect, manual override, rendering, empty DNA, stale invalidation
+
+---
+
+## Plan de implementación v0.10.0 — Resumen con IA
+
+### Problema
+
+`buildStructuredSummary` genera resúmenes mecánicos ("Editó 3 archivos. Tools: Edit(5), Bash(3)"). No captura el SIGNIFICADO de la sesión. Un LLM genera "Implementó autenticación OAuth2 con refresh tokens" — mucho más útil para la próxima sesión.
+
+### Diseño: Opción C (Hook + API + fallback)
+
+```
+┌──────────────────┐    ┌─────────────────┐    ┌──────────────┐
+│ SessionEnd hook   │───▶│ Collect context: │───▶│ Claude API   │
+│                   │    │ - observations   │    │ (Haiku/fast) │
+│                   │    │ - prompts (5)    │    │ timeout: 5s  │
+│                   │    │ - snapshot       │    │              │
+└──────────────────┘    └─────────────────┘    └──────┬───────┘
+                                                       │
+                         ┌─────────────────┐           │
+                         │ summary_text =   │◀──────────┘
+                         │ "Implementó..."  │
+                         └─────────────────┘
+                                │
+                         fallback si no hay API key
+                         o timeout/error:
+                                │
+                         ┌─────────────────┐
+                         │ buildStructured  │
+                         │ Summary() actual │
+                         └─────────────────┘
+```
+
+### Configuración
+
+```json
+// ~/.local-mem/settings.json (opt-in)
+{
+  "ai_summary": {
+    "enabled": true,
+    "api_key": "sk-ant-...",    // o env LOCAL_MEM_AI_KEY
+    "model": "claude-haiku-4-5-20251001",
+    "timeout_ms": 5000
+  }
+}
+```
+
+- **Sin API key** → feature desactivada, usa `buildStructuredSummary()` como hasta ahora
+- **fetch() nativo de Bun** → sin dependencias nuevas
+- **~$0.001 por sesión** con Haiku (~500 input + ~100 output tokens)
+
+### Prompt template
+
+```
+Resume esta sesión de desarrollo en 2-3 frases concisas en español.
+Enfócate en QUÉ se hizo y POR QUÉ, no en herramientas usadas.
+
+Archivos modificados: {files_modified}
+Últimos pedidos del usuario: {prompts}
+Tarea actual: {current_task}
+Acciones principales: {top_observations}
+
+Responde SOLO con el resumen, sin preámbulos.
+```
+
+### Archivos a modificar
+
+| Archivo | Cambio | Complejidad |
+|---------|--------|-------------|
+| `scripts/ai.mjs` (NUEVO) | `generateAiSummary(context)` — fetch a Claude API | M |
+| `scripts/session-end.mjs` | Llamar `generateAiSummary()` antes de `buildStructuredSummary()` | S |
+| `scripts/shared.mjs` | `loadSettings()` — leer ~/.local-mem/settings.json | S |
+| `mcp/server.mjs` | Tool `configure` o documentar en README | S |
+| `tests/v100.test.mjs` | Tests con mock de API | M |
+
+### Dependencias entre tareas
+
+```
+┌─────────────────────┐
+│ T1: AI module        │──────┐
+│ (scripts/ai.mjs)     │      │
+└─────────────────────┘      │
+                              ▼
+┌─────────────────────┐  ┌────────────────────┐
+│ T2: Settings loader  │  │ T3: Integration    │
+│ (shared.mjs)         │  │ (session-end.mjs)  │
+└──────────┬──────────┘  └────────────────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ T4: Tests            │
+│ (tests/v100.test.mjs)│
+└─────────────────────┘
+```
+
+- **T1 + T2 parallelizables** (archivos distintos)
+- **T3 depende de T1 + T2**
+- **T4 secuencial al final**
+
+### Ejecución — Asignación de agentes
+
+**Batch 1: T1 + T2 (paralelo, 2 agentes)**
+
+| Agente | Rol | Archivo |
+|--------|-----|---------|
+| A1: API Integration Specialist | fetch + retry + timeout | `scripts/ai.mjs` |
+| A2: Config Engineer | settings loader + validation | `scripts/shared.mjs` |
+
+**Batch 2: T3 (secuencial, 1 agente)**
+
+| Agente | Rol | Archivo |
+|--------|-----|---------|
+| A3: Integration Architect | Wiring en session-end | `scripts/session-end.mjs` |
+
+**Batch 3: T4 (secuencial, 1 agente)**
+
+| Agente | Rol | Archivo |
+|--------|-----|---------|
+| A4: Test Architect | Tests con API mock | `tests/v100.test.mjs` |
+
+### Edge cases documentados
+
+- **Sin API key** → silencioso, usa buildStructuredSummary
+- **Timeout 5s** → fallback, no bloquea cierre
+- **Rate limit 429** → fallback, log warning
+- **Sesión con 0 actividad** → no llamar API
+- **API devuelve basura** → validar length (10-500 chars), fallback si fuera de rango
+- **Privacidad**: datos van a la API — documentar explícitamente (ya es Claude, pero opt-in)
+
+### Criterio de aceptación
+
+- Con API key configurada: resumen semántico de 2-3 frases reemplaza al mecánico
+- Sin API key: comportamiento idéntico al actual (buildStructuredSummary)
+- Timeout de 5s: nunca bloquea más de 5s el cierre de sesión
+- Error de API: fallback silencioso + log a stderr
+- Tests pasan con mock de API (sin llamadas reales)
+
+---
+
+## Plan de implementación v0.11.0 — Budget-aware rendering
+
+### Problema
+
+Límites hardcoded (200 obs, 50 prompts, 30 líneas, 5 thinking) no se adaptan. Poca actividad → desperdicia espacio. Mucha actividad → corta arbitrariamente. Budget-aware llena secciones por PRIORIDAD hasta agotar un budget configurable.
+
+### Diseño: BudgetRenderer
+
+```javascript
+// Budgets por nivel (tokens estimados)
+const LEVEL_BUDGETS = {
+  1: 150,    // ya está, no necesita budget
+  2: 800,
+  3: 1200,
+};
+
+// Prioridad de secciones (mayor a menor)
+const SECTION_PRIORITY = [
+  { id: 'estado',       minTokens: 40,  maxTokens: 150 },
+  { id: 'dna',          minTokens: 30,  maxTokens: 80  },
+  { id: 'resumen',      minTokens: 50,  maxTokens: 200 },
+  { id: 'pedidos',      minTokens: 30,  maxTokens: 100 },
+  { id: 'razonamiento', minTokens: 50,  maxTokens: 300 },
+  { id: 'actividad',    minTokens: 50,  maxTokens: 400 },
+  { id: 'cross',        minTokens: 40,  maxTokens: 200 },
+  { id: 'indice',       minTokens: 30,  maxTokens: 100 },
+];
+```
+
+```
+┌──────────────────────────────────────────────────┐
+│                 Budget: 1200 tokens               │
+├──────────────────────────────────────────────────┤
+│ ██████ Estado (120 tok)                           │
+│ ████ DNA (60 tok)                                 │
+│ ████████ Resumen (180 tok)                        │
+│ ███ Pedidos (80 tok)                              │
+│ ██████████ Razonamiento (250 tok)                 │
+│ ████████████ Actividad (320 tok)                  │
+│ ██████ Cross-session (140 tok)                    │
+│ ██ Índice (50 tok)                                │
+│                                     [budget OK]   │
+└──────────────────────────────────────────────────┘
+```
+
+### Archivos a modificar
+
+| Archivo | Cambio | Complejidad |
+|---------|--------|-------------|
+| `scripts/shared.mjs` | `estimateTokens(text)` helper | S |
+| `scripts/session-start.mjs` | Refactor `buildHistoricalContext` → secciones modulares con BudgetRenderer | L |
+| `tests/v110.test.mjs` | Tests de budget allocation | M |
+
+### Complejidad: L (Large)
+
+El refactor de `buildHistoricalContext` (~250 líneas) es el cambio más grande. Requiere:
+- Extraer cada sección en su propia función `renderXxx(ctx, level) → string`
+- BudgetRenderer que asigna tokens por prioridad
+- Truncamiento inteligente por sección (no cortar a mitad de línea)
+- Testing extenso de combinaciones nivel × budget × datos
+
+### Dependencias
+
+- **Requiere Project DNA** (sección `dna` en la tabla de prioridades)
+- No bloquea ni es bloqueado por Resumen con IA
+- Es el ÚLTIMO item del roadmap — todas las secciones deben existir antes de presupuestarlas
+
+### Ejecución — Asignación de agentes
+
+**Batch 1: T1 (1 agente)**
+
+| Agente | Rol | Archivo |
+|--------|-----|---------|
+| A1: Refactor Architect | Extraer secciones en funciones modulares | `session-start.mjs` |
+
+**Batch 2: T2 (1 agente)**
+
+| Agente | Rol | Archivo |
+|--------|-----|---------|
+| A2: Budget Engine | BudgetRenderer + estimateTokens + allocation | `session-start.mjs`, `shared.mjs` |
+
+**Batch 3: T3 (1 agente)**
+
+| Agente | Rol | Archivo |
+|--------|-----|---------|
+| A3: Test Architect | Tests de budget allocation y edge cases | `tests/v110.test.mjs` |
+
+### Criterio de aceptación
+
+- Output nunca excede el budget del nivel (±10% tolerancia)
+- Secciones de alta prioridad siempre presentes (al menos minTokens)
+- Secciones de baja prioridad se omiten si no hay budget
+- `estimateTokens()` tiene ≤15% error vs tokenizer real
+- Tests pasan para: budget exacto, overflow, underflow, empty sections
+
+---
+
+## Datos disponibles no aprovechados (oportunidad cross-version)
+
+Datos que ya están en la DB pero NO se inyectan en contexto:
+
+| Dato | Tabla | Estado actual | Aprovechamiento propuesto |
+|------|-------|---------------|---------------------------|
+| `technical_state` | execution_snapshots | Guardado, nunca en getRecentContext | Inyectar en cross-session (v0.9+) |
+| `confidence` | execution_snapshots | Guardado, nunca consultado | Mostrar como indicador en estado guardado |
+| `composite_score` | observation_scores | Solo en nivel 2 topScored | Usar para priorizar en budget-aware |
+| `tools_used` | session_summaries | En summaries, no en getRecentContext | Inyectar en resumen último sesión |
+| `files_read` + `files_modified` | session_summaries | En summaries, no renderizados | Ya se muestran en actividad (parcial) |
+| `prevSession.technical_state` | queryCuratedPrevSession | Traído pero nunca renderizado | Mostrar en cross-session |
+
+Estos son **quick wins** que no requieren features nuevas — solo wiring en rendering.
+
+---
+
+## Resumen de agentes por versión
+
+### v0.9.0 — Project DNA (5 agentes, 3 batches)
+
+| Batch | Agentes | Paralelismo | Workers |
+|-------|---------|-------------|---------|
+| B1 | A1: DB Architect | Secuencial | 1 |
+| B2 | A2: Heuristics Engineer, A3: Rendering Specialist, A4: MCP Protocol Expert | 3 en paralelo | 3 |
+| B3 | A5: Test Architect | Secuencial | 1 |
+| **Total** | **5 agentes** | **Max 3 concurrent** | |
+
+### v0.10.0 — Resumen con IA (4 agentes, 3 batches)
+
+| Batch | Agentes | Paralelismo | Workers |
+|-------|---------|-------------|---------|
+| B1 | A1: API Integration Specialist, A2: Config Engineer | 2 en paralelo | 2 |
+| B2 | A3: Integration Architect | Secuencial | 1 |
+| B3 | A4: Test Architect | Secuencial | 1 |
+| **Total** | **4 agentes** | **Max 2 concurrent** | |
+
+### v0.11.0 — Budget-aware rendering (3 agentes, 3 batches)
+
+| Batch | Agentes | Paralelismo | Workers |
+|-------|---------|-------------|---------|
+| B1 | A1: Refactor Architect | Secuencial | 1 |
+| B2 | A2: Budget Engine | Secuencial | 1 |
+| B3 | A3: Test Architect | Secuencial | 1 |
+| **Total** | **3 agentes** | **Secuencial (mismo archivo)** | |
+
+### Gran total: 12 agentes especializados, 9 batches
 
 ---
 

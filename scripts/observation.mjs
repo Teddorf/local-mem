@@ -2,6 +2,7 @@ import { readStdin } from './stdin.mjs';
 import { getDb, ensureSession, insertObservation, normalizeCwd, insertObservationScore, getSessionStats, saveExecutionSnapshot, getRecentObservations, pruneAutoSnapshots, getRecentPrompts } from './db.mjs';
 import { redact, isSensitiveFile, truncate } from './redact.mjs';
 import { AUTO_SNAPSHOT_INTERVAL } from './shared.mjs';
+import { TRUNCATE, RENDER, SCORING, TIMEOUTS } from './constants.mjs';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
@@ -50,8 +51,8 @@ function distill(tool_name, tool_input, tool_response, sensitive) {
       const file = inp.file_path || '';
       const action = `Edito ${file}`;
       if (sensitive) return { action, detail: null };
-      const oldStr = String(inp.old_string || '').slice(0, 80);
-      const newStr = String(inp.new_string || '').slice(0, 80);
+      const oldStr = String(inp.old_string || '').slice(0, TRUNCATE.DISTILL_EDIT_STRING);
+      const newStr = String(inp.new_string || '').slice(0, TRUNCATE.DISTILL_EDIT_STRING);
       const raw = `${oldStr} → ${newStr}`;
       return { action, detail: redact(raw) };
     }
@@ -60,18 +61,18 @@ function distill(tool_name, tool_input, tool_response, sensitive) {
       const file = inp.file_path || '';
       const action = `Creo ${file}`;
       if (sensitive) return { action, detail: null };
-      const lines = String(inp.content || '').split('\n').slice(0, 2).join('\n');
+      const lines = String(inp.content || '').split('\n').slice(0, RENDER.WRITE_PREVIEW_LINES).join('\n');
       return { action, detail: redact(lines) };
     }
 
     case 'Bash': {
-      const cmd = inp.command || inp.cmd || String(inp).slice(0, 200);
+      const cmd = inp.command || inp.cmd || String(inp).slice(0, TRUNCATE.DISTILL_BASH_CMD);
       let detail = null;
       if (tool_response) {
         const exitCode = tool_response.exitCode ?? tool_response.exit_code;
         const out = extractResponseText(tool_response) || '';
         const prefix = exitCode != null ? `[exit ${exitCode}] ` : '';
-        const body = out.slice(0, 500 - prefix.length);
+        const body = out.slice(0, TRUNCATE.DISTILL_BASH_OUTPUT - prefix.length);
         if (prefix || body.trim()) detail = redact(prefix + body);
       }
       return { action: redact(`Ejecuto: ${cmd}`), detail };
@@ -83,7 +84,7 @@ function distill(tool_name, tool_input, tool_response, sensitive) {
       if (tool_response) {
         const out = extractResponseText(tool_response) || '';
         if (/error|not found|cannot|failed/i.test(out)) {
-          detail = redact(out.slice(0, 200));
+          detail = redact(out.slice(0, TRUNCATE.DISTILL_READ_OUTPUT));
         }
       }
       return { action: `Leyo ${file}`, detail };
@@ -95,7 +96,7 @@ function distill(tool_name, tool_input, tool_response, sensitive) {
       let detail = null;
       if (tool_response) {
         const out = extractResponseText(tool_response) || '';
-        if (out.trim()) detail = redact(out.slice(0, 400));
+        if (out.trim()) detail = redact(out.slice(0, TRUNCATE.DISTILL_GREP_OUTPUT));
       }
       return { action: `Busco "${pattern}" en ${p}`, detail };
     }
@@ -106,8 +107,8 @@ function distill(tool_name, tool_input, tool_response, sensitive) {
       if (tool_response) {
         const out = extractResponseText(tool_response) || '';
         if (out.trim()) {
-          const files = out.split('\n').filter(Boolean).slice(0, 10).join('\n');
-          detail = redact(files.slice(0, 300));
+          const files = out.split('\n').filter(Boolean).slice(0, RENDER.GLOB_MAX_FILES).join('\n');
+          detail = redact(files.slice(0, TRUNCATE.DISTILL_GLOB_FILES));
         }
       }
       return { action: `Busco archivos: ${pattern}`, detail };
@@ -120,8 +121,8 @@ function distill(tool_name, tool_input, tool_response, sensitive) {
         const out = extractResponseText(tool_response) || '';
         if (out.trim()) {
           // Extract first 3 title+URL patterns or just take the first 300 chars
-          const lines = out.split('\n').filter(Boolean).slice(0, 6).join('\n');
-          detail = redact(lines.slice(0, 300));
+          const lines = out.split('\n').filter(Boolean).slice(0, RENDER.WEBSEARCH_MAX_LINES).join('\n');
+          detail = redact(lines.slice(0, TRUNCATE.DISTILL_WEBSEARCH));
         }
       }
       return { action: `Investigo: "${query}"`, detail };
@@ -132,7 +133,7 @@ function distill(tool_name, tool_input, tool_response, sensitive) {
       let detail = null;
       if (tool_response) {
         const out = extractResponseText(tool_response) || '';
-        if (out.trim()) detail = redact(out.slice(0, 300));
+        if (out.trim()) detail = redact(out.slice(0, TRUNCATE.DISTILL_WEBFETCH));
       }
       return { action: `Consulto: ${url}`, detail };
     }
@@ -142,7 +143,7 @@ function distill(tool_name, tool_input, tool_response, sensitive) {
       let detail = null;
       if (tool_response) {
         const out = extractResponseText(tool_response) || '';
-        if (out.trim()) detail = redact(out.slice(0, 300));
+        if (out.trim()) detail = redact(out.slice(0, TRUNCATE.DISTILL_AGENT));
       }
       return { action: `Delego: ${desc}`, detail };
     }
@@ -153,7 +154,7 @@ function distill(tool_name, tool_input, tool_response, sensitive) {
     }
 
     default: {
-      const preview = truncate(JSON.stringify(inp), 120);
+      const preview = truncate(JSON.stringify(inp), TRUNCATE.DISTILL_DEFAULT);
       return { action: `${tool_name}: ${preview}`, detail: null };
     }
   }
@@ -167,12 +168,12 @@ function computeScore(toolName, action) {
   const impact = impactMap[toolName] ?? 0.30;
   const errorFlag = /error|failed|crashed/i.test(action || '') ? 1.0 : 0.0;
   const toolWeight = impactMap[toolName] != null ? 1.0 : 0.5;
-  return 0.4 * impact + 0.2 * errorFlag + 0.1 * toolWeight;
+  return SCORING.WEIGHTS.impact * impact + SCORING.WEIGHTS.recency * errorFlag + SCORING.WEIGHTS.error * toolWeight;
 }
 
 function captureTechnicalState(cwd) {
   const state = {};
-  const timeout = 10_000;
+  const timeout = TIMEOUTS.TSC_COMMAND;
 
   // Solo si existe tsconfig.json Y typescript instalado localmente
   try {
@@ -199,13 +200,13 @@ function captureTechnicalState(cwd) {
       const stdout = execFileSync('bun', ['test'],
         { cwd, timeout, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
       const combined = stdout.replace(/\r/g, '');
-      state.test_summary = combined.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, 200);
+      state.test_summary = combined.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, TRUNCATE.DISTILL_TEST_SUMMARY);
     }
   } catch (e) {
     // bun test exits non-zero on failures — still capture summary
     const out = ((e.stdout || '') + (e.stderr || '')).replace(/\r/g, '');
     if (out) {
-      state.test_summary = out.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, 200);
+      state.test_summary = out.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, TRUNCATE.DISTILL_TEST_SUMMARY);
     }
   }
 
@@ -281,7 +282,7 @@ try {
     const stats = getSessionStats(session_id);
     if (stats && stats.observation_count > 0 && stats.observation_count % AUTO_SNAPSHOT_INTERVAL === 0) {
       const recentObs = getRecentObservations(cwd, { limit: AUTO_SNAPSHOT_INTERVAL });
-      const lastActions = recentObs.slice(0, 10).map(o => o.action).join('\n');
+      const lastActions = recentObs.slice(0, RENDER.MAX_RECENT_ACTIONS).map(o => o.action).join('\n');
       const recentPrompts = getRecentPrompts(cwd, 3);
       const lastPrompts = recentPrompts.map(p => p.prompt_text || '').join('\n');
 
@@ -306,14 +307,14 @@ try {
       saveExecutionSnapshot(session_id, {
         cwd,
         current_task: `Auto-snapshot at ${stats.observation_count} observations`,
-        execution_point: lastActions.slice(0, 500),
-        next_action: lastPrompts.slice(0, 300),
-        active_files: [...activeFilesSet].slice(0, 20),
+        execution_point: lastActions.slice(0, TRUNCATE.SNAPSHOT_EXECUTION_POINT),
+        next_action: lastPrompts.slice(0, TRUNCATE.SNAPSHOT_NEXT_ACTION),
+        active_files: [...activeFilesSet].slice(0, RENDER.MAX_ACTIVE_FILES),
         snapshot_type: 'auto',
         task_status: 'in_progress',
         technical_state: technicalState,
       });
-      pruneAutoSnapshots(session_id, cwd, 3);
+      pruneAutoSnapshots(session_id, cwd, RENDER.MAX_AUTO_SNAPSHOTS);
     }
   } catch (e) {
     process.stderr.write(`[local-mem] Auto-snapshot error: ${e.message}\n`);

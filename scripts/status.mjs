@@ -1,6 +1,7 @@
 import { getStatusData, normalizeCwd } from './db.mjs';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { TIME, PATTERNS } from './constants.mjs';
 
 const HOME = process.env.HOME || process.env.USERPROFILE;
 const SETTINGS_PATH = join(HOME, '.claude', 'settings.json');
@@ -31,7 +32,7 @@ try {
 
   if (data.lastActivity) {
     const ago = Math.round((Date.now() / 1000 - data.lastActivity) / 60);
-    const agoStr = ago < 1 ? 'just now' : ago < 60 ? `hace ${ago} min` : `hace ${Math.round(ago / 60)}h`;
+    const agoStr = ago < 1 ? 'just now' : ago < TIME.SECONDS_PER_MINUTE ? `hace ${ago} min` : `hace ${Math.round(ago / TIME.SECONDS_PER_MINUTE)}h`;
     console.log(`Ultima actividad: ${agoStr}`);
   } else {
     console.log(`Ultima actividad: nunca`);
@@ -66,7 +67,7 @@ try {
 
   // Cloud sync warning
   const dbLower = DB_PATH.toLowerCase();
-  const cloudDirs = ['onedrive', 'dropbox', 'icloud', 'google drive', 'nextcloud'];
+  const cloudDirs = PATTERNS.CLOUD_SYNC_DIRS;
   const cloudMatch = cloudDirs.find(d => dbLower.includes(d));
   if (cloudMatch) {
     console.log(`Cloud sync:   WARNING — DB en directorio sincronizado con ${cloudMatch}`);

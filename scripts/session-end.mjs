@@ -3,8 +3,9 @@ import { basename, isAbsolute } from 'path';
 import { readStdin } from './stdin.mjs';
 import { getDb, completeSession, getSessionStats, normalizeCwd, insertTurnLog } from './db.mjs';
 import { redact } from './redact.mjs';
+import { SIZES, TRUNCATE, RENDER } from './constants.mjs';
 
-const LAST_200KB = 200 * 1024;
+const LAST_200KB = SIZES.TRANSCRIPT_MAX_END;
 
 function extractTranscriptSummary(transcriptPath) {
   try {
@@ -45,7 +46,7 @@ function extractTranscriptSummary(transcriptPath) {
           .replace(/<parameter name="context">[\s\S]*?<\/parameter>/gi, '')
           .trim();
 
-        if (!text || text.length < 80) continue;
+        if (!text || text.length < TRUNCATE.SUMMARY_MIN_LENGTH) continue;
         if (TRIVIAL.test(text)) continue;
 
         bestText = text;
@@ -53,8 +54,8 @@ function extractTranscriptSummary(transcriptPath) {
     }
 
     if (!bestText) return null;
-    // Truncar a 500 chars
-    if (bestText.length > 500) bestText = bestText.slice(0, 500);
+    // Truncar a max chars
+    if (bestText.length > TRUNCATE.SUMMARY_MAX) bestText = bestText.slice(0, TRUNCATE.SUMMARY_MAX);
     return redact(bestText);
   } catch {
     return null;
@@ -84,8 +85,8 @@ export function buildStructuredSummary(sessionId, cwd, opts = {}) {
 
     // Archivos editados
     if (files_modified.length > 0) {
-      const shown = files_modified.slice(0, 5).map(f => basename(f)).join(', ');
-      const extra = files_modified.length > 5 ? ` +${files_modified.length - 5}` : '';
+      const shown = files_modified.slice(0, RENDER.MAX_FILES_SUMMARY).map(f => basename(f)).join(', ');
+      const extra = files_modified.length > RENDER.MAX_FILES_SUMMARY ? ` +${files_modified.length - RENDER.MAX_FILES_SUMMARY}` : '';
       parts.push(`Editó ${files_modified.length} archivo(s): ${shown}${extra}`);
     }
 
@@ -121,13 +122,13 @@ export function buildStructuredSummary(sessionId, cwd, opts = {}) {
     if (parts.length === 0) return null;
 
     const summary = parts.join('. ') + '.';
-    return redact(summary.slice(0, 500));
+    return redact(summary.slice(0, TRUNCATE.SUMMARY_MAX));
   } catch {
     return null;
   }
 }
 
-const MAX_TRANSCRIPT = 20 * 1024 * 1024; // 20MB — thinking blocks are spread throughout
+const MAX_TRANSCRIPT = SIZES.TRANSCRIPT_MAX_THINKING;
 
 async function extractThinkingFromTranscript(transcriptPath, sessionId, cwd) {
   let buf;
