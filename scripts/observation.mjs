@@ -1,9 +1,10 @@
 import { readStdin } from './stdin.mjs';
 import { getDb, ensureSession, insertObservation, normalizeCwd, insertObservationScore, getSessionStats, saveExecutionSnapshot, getRecentObservations, pruneAutoSnapshots, getRecentPrompts } from './db.mjs';
 import { redact, isSensitiveFile, truncate } from './redact.mjs';
+import { AUTO_SNAPSHOT_INTERVAL } from './shared.mjs';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 
 const SKIP_TOOLS = new Set([
   'TaskCreate', 'TaskUpdate', 'TaskList', 'TaskGet', 'ToolSearch',
@@ -173,10 +174,11 @@ function captureTechnicalState(cwd) {
   const state = {};
   const timeout = 10_000;
 
-  // Solo si existe tsconfig.json (JS puro, sin grep/tail — cross-platform)
+  // Solo si existe tsconfig.json Y typescript instalado localmente
   try {
-    if (existsSync(path.join(cwd, 'tsconfig.json'))) {
-      const stdout = execSync('npx tsc --noEmit 2>&1',
+    const tscPath = path.join(cwd, 'node_modules', 'typescript', 'bin', 'tsc');
+    if (existsSync(path.join(cwd, 'tsconfig.json')) && existsSync(tscPath)) {
+      const stdout = execFileSync(process.execPath, [tscPath, '--noEmit'],
         { cwd, timeout, encoding: 'utf8' });
       state.ts_errors = stdout.split('\n').filter(l => l.includes('error TS')).length;
     }
@@ -184,7 +186,6 @@ function captureTechnicalState(cwd) {
     // tsc exits non-zero when there are errors — parse stderr/stdout from the error
     if (e.stdout || e.stderr) {
       const out = (e.stdout || '') + (e.stderr || '');
-      // Only set ts_errors if output looks like tsc output (not npx/command-not-found errors)
       if (out.includes('error TS') || out.includes('.ts(') || out.includes('.tsx(')) {
         state.ts_errors = out.split('\n').filter(l => l.includes('error TS')).length;
       }
@@ -195,14 +196,15 @@ function captureTechnicalState(cwd) {
   try {
     const hasTests = existsSync(path.join(cwd, 'tests')) || existsSync(path.join(cwd, '__tests__'));
     if (hasTests) {
-      const stdout = execSync('bun test 2>&1',
-        { cwd, timeout, encoding: 'utf8' });
-      state.test_summary = stdout.replace(/\r/g, '').split('\n').filter(Boolean).slice(-3).join('\n').slice(0, 200);
+      const stdout = execFileSync('bun', ['test'],
+        { cwd, timeout, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+      const combined = stdout.replace(/\r/g, '');
+      state.test_summary = combined.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, 200);
     }
   } catch (e) {
     // bun test exits non-zero on failures — still capture summary
-    if (e.stdout || e.stderr) {
-      const out = ((e.stdout || '') + (e.stderr || '')).replace(/\r/g, '');
+    const out = ((e.stdout || '') + (e.stderr || '')).replace(/\r/g, '');
+    if (out) {
       state.test_summary = out.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, 200);
     }
   }
@@ -277,8 +279,8 @@ try {
   // Auto-snapshot every 25 observations (v0.7: with active files)
   try {
     const stats = getSessionStats(session_id);
-    if (stats && stats.observation_count > 0 && stats.observation_count % 25 === 0) {
-      const recentObs = getRecentObservations(cwd, { limit: 25 });
+    if (stats && stats.observation_count > 0 && stats.observation_count % AUTO_SNAPSHOT_INTERVAL === 0) {
+      const recentObs = getRecentObservations(cwd, { limit: AUTO_SNAPSHOT_INTERVAL });
       const lastActions = recentObs.slice(0, 10).map(o => o.action).join('\n');
       const recentPrompts = getRecentPrompts(cwd, 3);
       const lastPrompts = recentPrompts.map(p => p.prompt_text || '').join('\n');
@@ -298,6 +300,7 @@ try {
       let technicalState = null;
       try {
         technicalState = captureTechnicalState(cwd);
+        if (technicalState) technicalState = redact(technicalState);
       } catch { /* best-effort */ }
 
       saveExecutionSnapshot(session_id, {

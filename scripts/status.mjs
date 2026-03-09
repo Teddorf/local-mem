@@ -1,15 +1,16 @@
-import { getDb, getStatusData, normalizeCwd } from './db.mjs';
+import { getStatusData, normalizeCwd } from './db.mjs';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 const HOME = process.env.HOME || process.env.USERPROFILE;
 const SETTINGS_PATH = join(HOME, '.claude', 'settings.json');
 const DB_PATH = process.env.LOCAL_MEM_DB_PATH || join(HOME, '.local-mem', 'data', 'local-mem.db');
+const pkg = JSON.parse(readFileSync(import.meta.dirname + '/../package.json', 'utf8'));
 
 try {
   const cwd = normalizeCwd(process.cwd());
 
-  console.log('local-mem v0.1.0 — Health Check');
+  console.log(`local-mem v${pkg.version} — Health Check`);
   console.log('================================');
 
   // DB check

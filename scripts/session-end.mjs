@@ -15,42 +15,113 @@ function extractTranscriptSummary(transcriptPath) {
       : buf.toString('utf8');
 
     const lines = slice.split('\n').filter(l => l.trim());
-    let lastAssistant = null;
+    const TRIVIAL = /^(ok|listo|perfecto|hecho|done|sí|si|ya|claro|gracias|entendido|dale)[.!,\s]*$/i;
+    let bestText = null;
 
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
-        if (entry.type === 'assistant') {
-          lastAssistant = entry;
+        if (entry.type !== 'assistant') continue;
+
+        let text = '';
+        const msg = entry.message || entry;
+        if (msg.content) {
+          if (typeof msg.content === 'string') {
+            text = msg.content;
+          } else if (Array.isArray(msg.content)) {
+            text = msg.content
+              .filter(c => c.type === 'text')
+              .map(c => c.text || '')
+              .join('\n')
+              .trim();
+          }
         }
+
+        if (!text) continue;
+
+        // Limpiar system-reminders
+        text = text
+          .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
+          .replace(/<parameter name="context">[\s\S]*?<\/parameter>/gi, '')
+          .trim();
+
+        if (!text || text.length < 80) continue;
+        if (TRIVIAL.test(text)) continue;
+
+        bestText = text;
       } catch { /* skip malformed lines */ }
     }
 
-    if (!lastAssistant) return null;
+    if (!bestText) return null;
+    // Truncar a 500 chars
+    if (bestText.length > 500) bestText = bestText.slice(0, 500);
+    return redact(bestText);
+  } catch {
+    return null;
+  }
+}
 
-    let text = '';
-    const msg = lastAssistant.message || lastAssistant;
-    if (msg.content) {
-      if (typeof msg.content === 'string') {
-        text = msg.content;
-      } else if (Array.isArray(msg.content)) {
-        text = msg.content
-          .filter(c => c.type === 'text')
-          .map(c => c.text || '')
-          .join('\n')
-          .trim();
-      }
+function buildStructuredSummary(sessionId, cwd, opts = {}) {
+  try {
+    const tools_used = opts.tools_used || {};
+    const files_modified = opts.files_modified || [];
+    const db = getDb();
+    let snapshot = null;
+    try {
+      const nCwd = normalizeCwd(cwd);
+      snapshot = db.prepare(`
+        SELECT current_task, next_action, technical_state, snapshot_type
+        FROM execution_snapshots
+        WHERE session_id = ? AND cwd = ?
+        ORDER BY CASE WHEN snapshot_type = 'manual' THEN 0 ELSE 1 END, created_at DESC
+        LIMIT 1
+      `).get(sessionId, nCwd) || null;
+    } finally {
+      db.close();
     }
 
-    if (!text) return null;
+    const parts = [];
 
-    // Limpiar system-reminders
-    text = text
-      .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '')
-      .replace(/<parameter name="context">[\s\S]*?<\/parameter>/gi, '')
-      .trim();
+    // Archivos editados
+    if (files_modified.length > 0) {
+      const shown = files_modified.slice(0, 5).map(f => basename(f)).join(', ');
+      const extra = files_modified.length > 5 ? ` +${files_modified.length - 5}` : '';
+      parts.push(`Editó ${files_modified.length} archivo(s): ${shown}${extra}`);
+    }
 
-    return text ? redact(text) : null;
+    // Estado técnico
+    if (snapshot?.technical_state) {
+      try {
+        const ts = JSON.parse(snapshot.technical_state);
+        const tsParts = [];
+        if (ts.ts_errors !== undefined) tsParts.push(`${ts.ts_errors} TS errors`);
+        if (ts.test_summary) tsParts.push(ts.test_summary.split('\n').pop());
+        if (tsParts.length > 0) parts.push(tsParts.join(', '));
+      } catch {}
+    }
+
+    // Tarea principal
+    if (snapshot?.current_task && snapshot.snapshot_type === 'manual') {
+      parts.push(`Tarea: ${snapshot.current_task}`);
+    }
+
+    // Pendiente
+    if (snapshot?.next_action && snapshot.snapshot_type === 'manual') {
+      parts.push(`Pendiente: ${snapshot.next_action}`);
+    }
+
+    // Tools usados
+    const toolEntries = Object.entries(tools_used);
+    if (toolEntries.length > 0 && parts.length === 0) {
+      // Si no hay nada más, al menos listar tools
+      const toolStr = toolEntries.map(([k, v]) => `${k}(${v})`).join(', ');
+      parts.push(`Tools: ${toolStr}`);
+    }
+
+    if (parts.length === 0) return null;
+
+    const summary = parts.join('. ') + '.';
+    return redact(summary.slice(0, 500));
   } catch {
     return null;
   }
@@ -162,7 +233,14 @@ try {
     }
   }
 
-  if (useTranscript) {
+  const stats = getSessionStats(session_id);
+  const { tools_used, files_read, files_modified } = getToolsAndFiles(session_id);
+
+  // Intentar resumen estructurado primero (datos DB) — reutiliza tools/files ya extraídos
+  summaryText = buildStructuredSummary(session_id, cwd, { tools_used, files_modified });
+
+  // Fallback: extraer del transcript
+  if (!summaryText && useTranscript) {
     summaryText = extractTranscriptSummary(transcript_path);
   }
 
@@ -171,9 +249,6 @@ try {
       await extractThinkingFromTranscript(transcript_path, session_id, cwd);
     } catch { /* best-effort — session still completes normally */ }
   }
-
-  const stats = getSessionStats(session_id);
-  const { tools_used, files_read, files_modified } = getToolsAndFiles(session_id);
 
   const now = Math.floor(Date.now() / 1000);
   const startedAt = stats ? stats.started_at : null;

@@ -21,8 +21,12 @@ import {
   closeDb,
 } from '../scripts/db.mjs';
 
+import { readFileSync } from 'node:fs';
 import { redactObject } from '../scripts/redact.mjs';
 import { sanitizeXml, truncate } from '../scripts/redact.mjs';
+import { parseJsonSafe, formatTime, CONFIDENCE_LABELS } from '../scripts/shared.mjs';
+
+const pkg = JSON.parse(readFileSync(import.meta.dirname + '/../package.json', 'utf8'));
 
 // ---------------------------------------------------------------------------
 // CWD
@@ -376,14 +380,7 @@ function formatContextMarkdown(ctx) {
 
     // v0.7: confidence
     if (snapshot.confidence) {
-      const labels = {
-        1: 'explorando, no se si funciona',
-        2: 'implementado parcialmente, no testeado',
-        3: 'tests pasan pero no revisado',
-        4: 'revisado, falta probar manualmente',
-        5: 'listo para merge/deploy'
-      };
-      lines.push(`- Confianza: ${snapshot.confidence}/5${labels[snapshot.confidence] ? ` — ${labels[snapshot.confidence]}` : ''}`);
+      lines.push(`- Confianza: ${snapshot.confidence}/5${CONFIDENCE_LABELS[snapshot.confidence] ? ` — ${CONFIDENCE_LABELS[snapshot.confidence]}` : ''}`);
     }
   }
 
@@ -474,12 +471,6 @@ function formatContextMarkdown(ctx) {
   return lines.join('\n');
 }
 
-function parseJsonSafe(value) {
-  if (!value) return null;
-  if (typeof value !== 'string') return value;
-  try { return JSON.parse(value); } catch { return null; }
-}
-
 function renderCrossSessionMcp(lines, prevData, prevActions) {
   if (!prevData) return;
 
@@ -545,13 +536,6 @@ function formatAge(epoch) {
   if (diff < 3600) return `${Math.round(diff / 60)}m`;
   if (diff < 86400) return `${Math.round(diff / 3600)}h`;
   return `${Math.round(diff / 86400)}d`;
-}
-
-function formatTime(epoch) {
-  const d = new Date(epoch * 1000);
-  const h = d.getHours().toString().padStart(2, '0');
-  const m = d.getMinutes().toString().padStart(2, '0');
-  return `${h}:${m}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -782,7 +766,7 @@ async function handleMessage(msg) {
         jsonrpcResult(id, {
           protocolVersion: '2025-03-26',
           capabilities: { tools: {} },
-          serverInfo: { name: 'local-mem', version: '0.7.0' },
+          serverInfo: { name: 'local-mem', version: pkg.version },
         })
       );
       break;

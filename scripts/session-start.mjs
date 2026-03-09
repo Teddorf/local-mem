@@ -2,7 +2,7 @@ import { basename } from 'node:path';
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { readStdin } from './stdin.mjs';
 import {
   abandonOrphanSessions,
@@ -11,6 +11,7 @@ import {
   insertTurnLog,
 } from './db.mjs';
 import { sanitizeXml, truncate, redact } from './redact.mjs';
+import { parseJsonSafe, formatTime as formatHour, CONFIDENCE_LABELS } from './shared.mjs';
 
 async function checkForUpdate() {
   try {
@@ -46,14 +47,6 @@ function formatRelativeTime(epochSeconds) {
   return `hace ${diffDays}d`;
 }
 
-function formatHour(epochSeconds) {
-  if (!epochSeconds) return '';
-  const d = new Date(epochSeconds * 1000);
-  const h = d.getHours().toString().padStart(2, '0');
-  const m = d.getMinutes().toString().padStart(2, '0');
-  return `${h}:${m}`;
-}
-
 function buildWelcomeContext() {
   return `<local-mem-data type="welcome">
 local-mem esta activo. Esta es tu primera sesion en este proyecto.
@@ -68,20 +61,6 @@ function getDisclosureLevel(source) {
   if (source === 'clear') return 1;
   return 2; // startup = default
 }
-
-function parseJsonSafe(value) {
-  if (!value) return null;
-  if (typeof value !== 'string') return value;
-  try { return JSON.parse(value); } catch { return null; }
-}
-
-const CONFIDENCE_LABELS = {
-  1: 'explorando, no se si funciona',
-  2: 'implementado parcialmente, no testeado',
-  3: 'implementado, tests pasan pero no revisado',
-  4: 'tests pasan, revisado, falta probar manualmente',
-  5: 'todo OK, listo para merge/deploy'
-};
 
 function renderCrossSession(lines, prevData, prevActions) {
   if (!prevData) return;
@@ -166,10 +145,9 @@ function checkContextValidity(snapshot, cwd) {
 
   for (const file of files.slice(0, 10)) {
     try {
-      const stdout = execSync(
-        `git log --oneline --since="${sinceDate}" -- "${file}"`,
-        { cwd, timeout: 5000, encoding: 'utf8' }
-      );
+      const stdout = execFileSync('git', [
+        'log', '--oneline', `--since=${sinceDate}`, '--', file
+      ], { cwd, timeout: 5000, encoding: 'utf8' });
       const commits = stdout.trim().split('\n').filter(Boolean);
       if (commits.length > 0) {
         changed.push({ file, commits: commits.length });
@@ -178,6 +156,89 @@ function checkContextValidity(snapshot, cwd) {
   }
 
   return changed.length > 0 ? changed : null;
+}
+
+function groupObservations(observations) {
+  const editGroups = new Map(); // file → [{action, detail}]
+  const readGroups = new Map(); // file → count
+  const ungrouped = []; // Bash, Agent, WebSearch, Grep, Glob, etc.
+
+  for (const obs of observations) {
+    if ((obs.tool_name === 'Edit' || obs.tool_name === 'Write' || obs.tool_name === 'NotebookEdit') && obs.files) {
+      let files;
+      try { files = typeof obs.files === 'string' ? JSON.parse(obs.files) : obs.files; } catch { files = []; }
+      const file = Array.isArray(files) && files[0] ? files[0] : null;
+      if (file) {
+        if (!editGroups.has(file)) editGroups.set(file, []);
+        editGroups.get(file).push({ action: obs.action, detail: obs.detail, id: obs.id, created_at: obs.created_at });
+        continue;
+      }
+    }
+    if (obs.tool_name === 'Read' && obs.files) {
+      let files;
+      try { files = typeof obs.files === 'string' ? JSON.parse(obs.files) : obs.files; } catch { files = []; }
+      const file = Array.isArray(files) && files[0] ? files[0] : null;
+      if (file) {
+        readGroups.set(file, (readGroups.get(file) || 0) + 1);
+        continue;
+      }
+    }
+    ungrouped.push(obs);
+  }
+
+  return { editGroups, readGroups, ungrouped };
+}
+
+function renderGroupedObservations(lines, observations, maxLines) {
+  const { editGroups, readGroups, ungrouped } = groupObservations(observations);
+  let rendered = 0;
+
+  // 1. Archivos editados primero (más importantes)
+  for (const [file, edits] of editGroups) {
+    if (rendered >= maxLines) break;
+    const fileName = sanitizeXml(truncate(file, 80));
+    if (edits.length === 1) {
+      const e = edits[0];
+      let line = `- #${e.id ?? ''} ${fileName}`;
+      if (e.detail) line += `: ${sanitizeXml(truncate(e.detail, 80))}`;
+      lines.push(line);
+    } else {
+      const details = edits.slice(0, 5).map(e => sanitizeXml(truncate(e.detail || e.action || '', 60))).join('; ');
+      lines.push(`- ${fileName} (${edits.length} edits): ${truncate(details, 200)}`);
+    }
+    rendered++;
+  }
+
+  // 2. Reads agrupados
+  for (const [file, count] of readGroups) {
+    if (rendered >= maxLines) break;
+    const fileName = sanitizeXml(truncate(file, 80));
+    if (count === 1) {
+      lines.push(`- Leyó ${fileName}`);
+    } else {
+      lines.push(`- Leyó ${fileName} (${count}x)`);
+    }
+    rendered++;
+  }
+
+  // 3. Ungrouped (Bash, Agent, etc.)
+  for (const obs of ungrouped) {
+    if (rendered >= maxLines) break;
+    const num = obs.id ?? '';
+    const hora = sanitizeXml(formatHour(obs.created_at));
+    let accion = sanitizeXml(truncate(obs.action || '', 100));
+    if (obs.detail) {
+      accion = `${accion}: ${sanitizeXml(truncate(obs.detail, 80))}`;
+    }
+    lines.push(`- #${num} ${hora} ${accion}`);
+    rendered++;
+  }
+
+  // Overflow indicator
+  const total = editGroups.size + readGroups.size + ungrouped.length;
+  if (total > maxLines) {
+    lines.push(`- ... y ${total - rendered} acciones más`);
+  }
 }
 
 function buildHistoricalContext(project, ctx, source, level) {
@@ -284,6 +345,21 @@ function buildHistoricalContext(project, ctx, source, level) {
       if (snapshot.next_action) {
         lines.push(`- Siguiente: ${sanitizeXml(snapshot.next_action)}`);
       }
+      const plan = parseJsonSafe(snapshot.plan);
+      if (plan) {
+        if (Array.isArray(plan)) {
+          const items = plan.slice(0, 10).map((p, i) => `${i + 1}. ${sanitizeXml(String(p))}`).join('; ');
+          lines.push(`- Plan: ${truncate(items, 300)}`);
+        } else {
+          const planStr = typeof plan === 'string' ? plan : JSON.stringify(plan);
+          lines.push(`- Plan: ${sanitizeXml(truncate(planStr, 300))}`);
+        }
+      }
+      const pendingTasks = parseJsonSafe(snapshot.pending_tasks);
+      if (Array.isArray(pendingTasks) && pendingTasks.length > 0) {
+        const joined = pendingTasks.slice(0, 10).map(t => sanitizeXml(String(t))).join('; ');
+        lines.push(`- Tareas pendientes: ${truncate(joined, 500)}`);
+      }
       const decisions = parseJsonSafe(snapshot.open_decisions);
       if (Array.isArray(decisions) && decisions.length > 0) {
         lines.push(`- Decisiones abiertas: ${decisions.map(d => sanitizeXml(String(d))).join(', ')}`);
@@ -325,9 +401,12 @@ function buildHistoricalContext(project, ctx, source, level) {
     lines.push(``);
     lines.push(`## ${thinkingLabel}`);
     for (const t of thinking) {
+      const hora = sanitizeXml(formatHour(t.created_at));
       if (t.thinking_text) {
-        const hora = sanitizeXml(formatHour(t.created_at));
         lines.push(`- [${hora}] ${sanitizeXml(truncate(t.thinking_text, 500))}`);
+      }
+      if (level === 3 && t.response_text) {
+        lines.push(`- [${hora}] Respondió: ${sanitizeXml(truncate(t.response_text, 300))}`);
       }
     }
   }
@@ -343,36 +422,37 @@ function buildHistoricalContext(project, ctx, source, level) {
     }
   }
 
-  // --- Acciones recientes (nivel 2+) ---
-  if (level >= 2 && observations && observations.length > 0) {
-    const count = level === 3 ? 10 : 5;
-    lines.push(``);
-    lines.push(`## Ultimas ${Math.min(observations.length, count)} acciones`);
-
-    for (const obs of observations.slice(0, count)) {
-      const num = obs.id ?? '';
-      const hora = sanitizeXml(formatHour(obs.created_at));
-      let accion = sanitizeXml(truncate(obs.action || '', 100));
-      if (obs.detail) {
-        const detail = sanitizeXml(truncate(obs.detail, 100));
-        accion = `${accion}: ${detail}`;
+  // --- Actividad (nivel 2+) ---
+  if (level >= 2 && (observations?.length > 0 || topScored?.length > 0)) {
+    if (level === 3) {
+      // Nivel 3 (compact): TODAS las obs agrupadas
+      lines.push(``);
+      lines.push(`## Actividad de esta sesión`);
+      renderGroupedObservations(lines, observations, 30);
+    } else {
+      // Nivel 2 (startup): top scored con detail, fallback a obs cronológicas
+      lines.push(``);
+      if (topScored && topScored.length > 0) {
+        lines.push(`## Actividad relevante`);
+        for (const obs of topScored.slice(0, 7)) {
+          const num = obs.id ?? '';
+          const hora = sanitizeXml(formatHour(obs.created_at));
+          const accion = sanitizeXml(truncate(obs.action || '', 80));
+          const score = obs.composite_score != null ? Number(obs.composite_score).toFixed(2) : '';
+          lines.push(`- #${num} ${hora} ${accion} [${score}]`);
+        }
+      } else if (observations && observations.length > 0) {
+        lines.push(`## Ultimas ${Math.min(observations.length, 5)} acciones`);
+        for (const obs of observations.slice(0, 5)) {
+          const num = obs.id ?? '';
+          const hora = sanitizeXml(formatHour(obs.created_at));
+          let accion = sanitizeXml(truncate(obs.action || '', 100));
+          if (obs.detail) {
+            accion = `${accion}: ${sanitizeXml(truncate(obs.detail, 100))}`;
+          }
+          lines.push(`- #${num} ${hora} ${accion}`);
+        }
       }
-      lines.push(`- #${num} ${hora} ${accion}`);
-    }
-  }
-
-  // --- Top por relevancia (nivel 2+) ---
-  if (level >= 2 && topScored && topScored.length > 0) {
-    const maxTop = level === 3 ? 10 : 7;
-    lines.push(``);
-    lines.push(`## Top por relevancia`);
-
-    for (const obs of topScored.slice(0, maxTop)) {
-      const num = obs.id ?? '';
-      const hora = sanitizeXml(formatHour(obs.created_at));
-      const accion = sanitizeXml(truncate(obs.action || '', 80));
-      const score = obs.composite_score != null ? Number(obs.composite_score).toFixed(2) : '';
-      lines.push(`- #${num} ${hora} ${accion} [${score}]`);
     }
   }
 
@@ -418,37 +498,63 @@ function buildHistoricalContext(project, ctx, source, level) {
 }
 
 const LAST_500KB = 500 * 1024;
+const LAST_2MB = 2 * 1024 * 1024;
 
 /**
- * Find the most recent transcript JSONL that is NOT the current session.
- * Searches ~/.claude/projects/ for .jsonl files.
+ * Find a transcript JSONL file for this project.
+ * opts.includeCurrent: if true, includes the current session's transcript (for compact).
+ * If false, finds the most recent transcript that is NOT the current session.
  */
-function findPreviousTranscript(currentSessionId) {
+function findTranscript(currentSessionId, projectCwd, opts = {}) {
   try {
     const claudeDir = join(homedir(), '.claude', 'projects');
+
+    // Claude Code encodes project dirs as: lowercase path, separators → '-', colon → '-'
+    // e.g. C:\Users\m_ben\project → c--users-m-ben-project
+    const expectedDirName = (projectCwd || '').toLowerCase().replace(/[\\/]+/g, '-').replace(/:/g, '-');
+    let targetProjDir = null;
+
+    // Exact match first
+    for (const projDir of readdirSync(claudeDir, { withFileTypes: true })) {
+      if (!projDir.isDirectory()) continue;
+      if (projDir.name.toLowerCase() === expectedDirName) {
+        targetProjDir = join(claudeDir, projDir.name);
+        break;
+      }
+    }
+
+    // Fallback: endsWith match (handles minor encoding differences)
+    if (!targetProjDir) {
+      for (const projDir of readdirSync(claudeDir, { withFileTypes: true })) {
+        if (!projDir.isDirectory()) continue;
+        if (projDir.name.toLowerCase().endsWith(expectedDirName.slice(-60))) {
+          targetProjDir = join(claudeDir, projDir.name);
+          break;
+        }
+      }
+    }
+
+    if (!targetProjDir) return null;
+
     let best = null;
     let bestMtime = 0;
 
-    // Walk one level of project dirs
-    for (const projDir of readdirSync(claudeDir, { withFileTypes: true })) {
-      if (!projDir.isDirectory()) continue;
-      const projPath = join(claudeDir, projDir.name);
-      try {
-        for (const file of readdirSync(projPath)) {
-          if (!file.endsWith('.jsonl')) continue;
-          const sessionId = file.replace('.jsonl', '');
-          if (sessionId === currentSessionId) continue;
-          const filePath = join(projPath, file);
-          try {
-            const st = statSync(filePath);
-            if (st.mtimeMs > bestMtime) {
-              bestMtime = st.mtimeMs;
-              best = filePath;
-            }
-          } catch { /* skip */ }
-        }
-      } catch { /* skip */ }
-    }
+    try {
+      for (const file of readdirSync(targetProjDir)) {
+        if (!file.endsWith('.jsonl')) continue;
+        const sessionId = file.replace('.jsonl', '');
+        if (!opts.includeCurrent && sessionId === currentSessionId) continue;
+        const filePath = join(targetProjDir, file);
+        try {
+          const st = statSync(filePath);
+          if (st.mtimeMs > bestMtime) {
+            bestMtime = st.mtimeMs;
+            best = filePath;
+          }
+        } catch { /* skip */ }
+      }
+    } catch { /* skip */ }
+
     return best;
   } catch {
     return null;
@@ -459,12 +565,12 @@ function findPreviousTranscript(currentSessionId) {
  * Extract last N thinking blocks from a transcript JSONL file.
  * Returns array of { thinking_text, response_text } objects.
  */
-function extractThinkingFromTranscript(transcriptPath, count = 5) {
+function extractThinkingFromTranscript(transcriptPath, count = 5, maxBytes = LAST_500KB) {
   try {
     let buf;
     try { buf = readFileSync(transcriptPath); } catch { return []; }
-    const slice = buf.length > LAST_500KB
-      ? buf.slice(buf.length - LAST_500KB).toString('utf8')
+    const slice = buf.length > maxBytes
+      ? buf.slice(buf.length - maxBytes).toString('utf8')
       : buf.toString('utf8');
 
     const lines = slice.split('\n').filter(l => l.trim());
@@ -531,9 +637,9 @@ async function main() {
   let compactThinking = [];
   if (source === 'compact') {
     try {
-      const prevTranscript = findPreviousTranscript(sessionId);
+      const prevTranscript = findTranscript(sessionId, cwd, { includeCurrent: true });
       if (prevTranscript) {
-        compactThinking = extractThinkingFromTranscript(prevTranscript, 5);
+        compactThinking = extractThinkingFromTranscript(prevTranscript, 5, LAST_2MB);
         // Save to turn_log for persistence
         for (let i = 0; i < compactThinking.length; i++) {
           try {

@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-03-06
+
+### Added
+- **Shared module** (`scripts/shared.mjs`): extracted `parseJsonSafe`, `formatTime`, `CONFIDENCE_LABELS`, `AUTO_SNAPSHOT_INTERVAL` — used by `server.mjs`, `session-start.mjs`, `observation.mjs`
+
+### Changed
+- **Security**: `mkdirSync` for data directory now uses `mode: 0o700` (POSIX: owner-only access)
+- **Security**: `captureTechnicalState()` resolves `tsc` from `node_modules/typescript/bin/tsc` directly (no `npx` — prevents silent downloads and PATH poisoning), executed via `execFileSync` without shell
+- **Security**: `technical_state` now passes through `redact()` before saving (consistency with observation pipeline)
+- **Security**: `checkContextValidity()` uses `execFileSync('git', [...args])` instead of shell string interpolation
+- **Security**: `findPreviousTranscript()` now filters by project directory using Claude Code's encoding convention (prevents cross-project context injection during `/compact`)
+- **Security**: `bun test` in `captureTechnicalState()` now uses `execFileSync` without shell (was `execSync` with `2>&1`)
+- **Consistency**: `CONFIDENCE_LABELS` unified across `server.mjs` and `session-start.mjs` via shared module
+- **Consistency**: `server.mjs` version now read from `package.json` instead of hardcoded `'0.7.0'`
+
+### Fixed
+- **Bug**: `status.mjs` displayed `v0.1.0` instead of actual version — now reads from `package.json`
+- **Bug**: `turnLogCutoff` in `db.mjs` cleanup was hardcoded to 30 days, ignoring user's `olderThanDays` parameter — now uses same cutoff as other tables
+- **Bug**: `CONFIDENCE_LABELS` diverged between `server.mjs` (shortened) and `session-start.mjs` (full) — unified
+- Dead import: removed unused `getDb` from `status.mjs`
+- SPEC.md: removed "planned" from version 0.7.0 (already implemented)
+
 ## [0.7.0] - 2026-03-06
 
 ### Added

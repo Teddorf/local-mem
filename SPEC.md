@@ -1,7 +1,7 @@
 # SPEC: local-mem — Memoria persistente local para Claude Code
 
-**Version**: 0.7.0-planned
-**Fecha**: 2026-03-06
+**Version**: 0.8.0 (draft)
+**Fecha**: 2026-03-09
 **Status**: Draft
 
 ---
@@ -26,11 +26,242 @@
 16. [Audit QA Post-Implementación](#audit-qa-post-implementacion-v010) — Bugs, falsos positivos, score
 17. [Deuda técnica conocida](#deuda-tecnica-conocida-v01--v06) — Limitaciones actuales
 18. [Plan de implementación v0.6.0](#plan-de-implementacion-v060) — Grafo de dependencias, fases
-19. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
+19. [Plan de implementación v0.8.0](#plan-de-implementacion-v080) — Inyección semántica, 10 fixes, 3 batches
+20. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
 
 ---
 
 ## Changelog del SPEC
+
+### [0.8.0] — 2026-03-09 (draft)
+#### Inyección Semántica de Contexto — "No perder nada"
+
+**Root cause**: La inyección de contexto actual tiene ~30% de señal útil. Los problemas principales: 1) En compact, se lee el transcript de OTRA sesión (bug crítico), 2) Solo se inyectan 10 de N observations y 5 de N prompts, perdiendo ~85% del contexto de la sesión actual, 3) Los auto-snapshots contaminan campos "Pendiente" y "Decisiones" con datos crudos (build logs, prompts sin curar), 4) El resumen viene del último mensaje del asistente (puede ser "Listo" o "Perfecto"), 5) Las secciones "Últimas N acciones" y "Top por relevancia" se solapan, desperdiciando ~100 tokens, 6) Los campos `plan` y `pending_tasks` del snapshot existen en la DB pero nunca se inyectan.
+
+**Principio**: El nivel 3 (compact/resume) debe capturar TODO el contexto de la sesión actual. "No se escapa nada" es el criterio de aceptación.
+
+**Análisis**: Diagnóstico con Research v2.1 --all. Se identificó que el pipeline Captura → Almacenamiento → Inyección tiene el cuello de botella en la Inyección. El almacenamiento (SQLite + FTS5) es sólido. La captura es decente. Pero la inyección pierde la mayoría de los datos disponibles.
+
+##### Diagnóstico: pérdida de contexto en compact (nivel 3)
+
+Estado actual de pérdida en una sesión con 80 obs, 15 prompts, 30 thinking blocks:
+
+| Dato | En DB | Inyectado | Pérdida |
+|------|-------|-----------|---------|
+| Observations | 80 | 10 | 70 (87%) |
+| User prompts | 15 | 5 | 10 (67%) |
+| Thinking (sesión actual) | 0 (BUG: lee otra sesión) | 0 | 100% |
+| Response text (turn_log) | Capturado | Nunca inyectado | 100% |
+| Snapshot plan | En DB | Nunca inyectado | 100% |
+| Snapshot pending_tasks | En DB | Nunca inyectado | 100% |
+| Conversación plain text | Nunca capturado | N/A | 100% |
+
+##### 10 fixes — inventario completo
+
+| ID | Prioridad | Descripción | Archivos |
+|----|-----------|-------------|----------|
+| F1 | P0-BUG | Transcript correcto en compact | session-start.mjs |
+| F2 | P0 | Todas obs de sesión actual en nivel 3 | db.mjs, session-start.mjs |
+| F3 | P0 | Todos prompts en nivel 3 | db.mjs |
+| F4 | P0 | Filtrar auto-snapshots de cross-session | db.mjs |
+| F5 | P1 | Inyectar plan + pending_tasks | session-start.mjs |
+| F6 | P1 | Resumen estructurado (no último msg) | session-end.mjs |
+| F7 | P1 | Eliminar overlap acciones/top relevancia | session-start.mjs |
+| F8 | P1 | Inyectar response_text en nivel 3 | session-start.mjs |
+| F9 | P2 | Dedup/agrupación de edits por archivo | session-start.mjs |
+| F10 | P2 | Thinking selection inteligente (FTS5) | db.mjs, session-start.mjs |
+
+##### F1: Transcript correcto en compact [P0-BUG]
+
+- BUG: `findPreviousTranscript()` (session-start.mjs:404) EXCLUYE el `sessionId` actual (`if (sessionId === currentSessionId) continue`). En compact, la sesión continúa con el MISMO sessionId. Resultado: lee thinking de OTRA sesión.
+- CHANGE: Renombrar `findPreviousTranscript()` → `findTranscript()` con param `opts.current`
+- CHANGE: En compact/resume: `findTranscript(sessionId, cwd, { current: true })` → busca `<sessionId>.jsonl` directamente
+- CHANGE: En startup: `findTranscript(sessionId, cwd, { current: false })` → busca el más reciente que NO sea este (comportamiento actual)
+- CHANGE: En compact, leer hasta 2MB del transcript (no 500KB) para capturar más thinking blocks de la sesión actual
+- NOTA: `readFileSync` lee lo que hay en disco aunque Claude Code siga escribiendo — safe
+
+##### F2: Todas las observations de sesión actual en nivel 3 [P0]
+
+- BUG: `getRecentContext()` (db.mjs:625) usa `obsLimit = level === 3 ? 10 : 5` y filtra por `cwd`, no por `session_id`. Resultado: solo 10 obs, y pueden ser de otra sesión del mismo proyecto.
+- CHANGE: En nivel 3, nueva query que trae TODAS las obs de la sesión ACTIVA:
+  ```sql
+  SELECT o.id, o.tool_name, o.action, o.files, o.detail, o.cwd, o.created_at
+  FROM observations o WHERE o.session_id = ?
+  ORDER BY o.created_at ASC
+  ```
+- CHANGE: ORDER BY ASC en nivel 3 (cronológico, para entender el flujo). ORDER BY DESC en nivel 2 (más recientes primero, como hoy)
+- CHANGE: La query de sesión activa se obtiene una sola vez y se reutiliza en F2+F3:
+  ```sql
+  SELECT session_id FROM sessions
+  WHERE cwd = ? AND status = 'active'
+  ORDER BY started_at DESC LIMIT 1
+  ```
+- FALLBACK: Si no hay sesión active → últimas 10 por cwd (como hoy)
+- RENDER: Las obs se pasan al renderer de agrupación (F9). Cap de 50 obs renderizadas.
+- IMPACTO: +100-300 tokens en nivel 3 (compensado por F7 y F9)
+
+##### F3: Todos los prompts en nivel 3 [P0]
+
+- CHANGE: `getRecentContext()` (db.mjs:624): `promptLimit = level === 3 ? 50 : 5`
+- CHANGE: En nivel 3, query filtra por `session_id` de sesión activa (no por cwd global):
+  ```sql
+  SELECT p.prompt_text, p.created_at
+  FROM user_prompts p WHERE p.session_id = ?
+  ORDER BY p.created_at ASC
+  ```
+- CHANGE: ORDER BY ASC en nivel 3 (cronológico)
+- IMPACTO: +50-150 tokens (prompts son cortos, ~20 tok c/u)
+
+##### F4: Filtrar auto-snapshots de cross-session [P0]
+
+- BUG: `queryCuratedPrevSession()` (db.mjs:728-736) hace fallback a auto-snapshots. Auto-snapshots llenan `next_action` con prompts crudos y `execution_point` con acciones crudas (observation.mjs:309-310). Resultado: "Pendiente: 13:12:20.930 Running build in Washington, D.C...."
+- CHANGE: JOIN de snapshot en `queryCuratedPrevSession()` solo acepta `snapshot_type = 'manual'`:
+  ```sql
+  LEFT JOIN execution_snapshots es
+    ON es.session_id = ps.session_id
+    AND es.snapshot_type = 'manual'
+    AND es.id = (
+      SELECT id FROM execution_snapshots
+      WHERE session_id = ps.session_id
+        AND snapshot_type = 'manual'
+      ORDER BY created_at DESC LIMIT 1
+    )
+  ```
+- EFECTO: Si no hay snapshot manual, `es.*` será NULL. El renderer ya maneja NULLs → "Pendiente", "Decisiones", "Bloqueantes" simplemente no aparecen en vez de mostrar basura.
+- NOTA: El snapshot PROPIO (sección "Estado guardado") SÍ puede fallback a auto, porque muestra datos de la sesión actual. Solo la cross-session necesita filtrar.
+- IMPACTO: -20 a -80 tokens (elimina basura)
+
+##### F5: Inyectar plan + pending_tasks [P1]
+
+- `execution_snapshots` tiene campos `plan` (TEXT/JSON array) y `pending_tasks` (TEXT/JSON array) que se GUARDAN via `save_state` pero NUNCA se renderizan en `buildHistoricalContext()`
+- CHANGE: En `buildHistoricalContext()`, sección "Estado guardado" (session-start.mjs:257-277), después de confidence, agregar render de plan y pending_tasks
+- RENDER (nivel 2+):
+  ```
+  - Plan:
+    1. Extender mock server con Google provider
+    2. Auth helper con refresh tokens
+    3. Test e2e 3 scenarios
+  - Pendientes:
+    - Cleanup de tokens expirados
+    - PR review
+  ```
+- Cap: máximo 10 items de plan y 10 de pending_tasks
+- IMPACTO: +30-80 tokens (solo cuando hay plan/pending)
+
+##### F6: Resumen estructurado [P1]
+
+- BUG: `extractTranscriptSummary()` (session-end.mjs:9-57) toma el ÚLTIMO `entry.type === 'assistant'` del transcript. Si la última respuesta es "Listo" → resumen inútil. Ejemplo real: "Perfecto. Queda así:"
+- CHANGE: Nueva función `buildStructuredSummary()` que construye el resumen desde datos estructurados ya disponibles:
+  - Archivos editados (de `getToolsAndFiles()`)
+  - Estado técnico (del último auto-snapshot `technical_state`)
+  - Tarea principal (del último snapshot manual `current_task`)
+  - Qué quedó pendiente (del snapshot `next_action`)
+- CHANGE: `buildStructuredSummary()` se ejecuta PRIMERO. Fallback a `extractTranscriptSummary()` solo si el estructurado retorna null.
+- EJEMPLO output: "Editó 5 archivos en auth/. 23 tests pasan, 0 TS errors. Tarea: refresh token. Pendiente: test e2e."
+- IMPACTO: 0 tokens extra (mismo espacio, mejor contenido)
+
+##### F7: Eliminar overlap acciones/top relevancia [P1]
+
+- "Últimas N acciones" y "Top por relevancia" muestran las MISMAS observations con formato diferente. En sesiones cortas, son literalmente idénticas. ~100 tokens desperdiciados.
+- CHANGE: Fusionar en una sola sección por nivel:
+  - Nivel 2 (startup): solo "Actividad relevante" (top scored con detail). Eliminar "Últimas N acciones".
+  - Nivel 3 (compact): solo "Actividad de esta sesión" (TODAS las obs agrupadas por F9). Eliminar "Top por relevancia" (redundante cuando tenés todo).
+- FALLBACK: Si topScored vacío pero observations no → mostrar obs cronológicas
+- IMPACTO: -80 a -120 tokens
+
+##### F8: Inyectar response_text en nivel 3 [P1]
+
+- `turn_log` guarda `thinking_text` Y `response_text`. Solo `thinking_text` se inyecta (session-start.mjs:301-311). `response_text` contiene decisiones explicadas al usuario, código sugerido, confirmaciones — contexto valioso.
+- CHANGE: En nivel 3, incluir response_text junto a thinking_text:
+  ```
+  - [14:30] Pensé: decidí usar mutex para refresh concurrent
+  - [14:30] Respondí: Implementé mutex pattern. El interceptor ahora...
+  ```
+- NOTA: Solo en nivel 3 (compact/resume). En nivel 2 (startup) solo thinking es suficiente.
+- IMPACTO: +50-100 tokens solo en nivel 3
+- DEPENDENCIA: Requiere F1 (transcript correcto) para tener response_text de la sesión ACTUAL
+
+##### F9: Dedup/agrupación de edits por archivo [P2]
+
+- 5 edits al mismo archivo = 5 líneas en el output. Token waste.
+- CHANGE: Nueva función `groupObservations(observations)`:
+  - Agrupa Edit/Write por archivo: `"src/foo.ts (3 edits): cambio A; cambio B; cambio C"`
+  - Agrupa reads repetidos: `"Leyó src/foo.ts (3x)"`
+  - Deja ungrouped: Bash, Agent, WebSearch, etc. (se renderizan individualmente)
+- CHANGE: Nueva función `renderGroupedObservations(lines, observations, maxLines)`:
+  - Cap de `maxLines` (default 30 en nivel 3, 10 en nivel 2)
+  - Archivos editados primero (más importantes), luego reads agrupados, luego ungrouped
+  - Si hay más obs que maxLines: `"... y N acciones más"`
+- IMPACTO: -30% a -50% tokens en sesiones con muchos edits al mismo archivo
+- USADO POR: F2 (nivel 3) y F7 (nivel 2)
+
+##### F10: Thinking selection inteligente [P2]
+
+- Se capturan los últimos N thinking blocks por `created_at`. Los últimos suelen ser los más superficiales ("Let me read..."). Los más valiosos (decisiones, trade-offs) están en el medio.
+- CHANGE: Nueva función `getKeyThinking(cwd, sessionId, limit)` en db.mjs:
+  - Usa FTS5 para buscar thinking blocks con keywords de decisión (bilingüe):
+    `'decidí OR decided OR opté OR chose OR plan OR trade-off OR porque OR because OR problema OR problem OR solución OR solution'`
+  - Fallback: si FTS no encuentra suficientes, completar con los más recientes (como hoy)
+  - Ordenar cronológicamente para el output
+- CHANGE: En `getRecentContext()`, reemplazar query de thinking por `getKeyThinking()`
+- FILTRO: Ignorar thinking blocks < 50 chars (son ruido operativo)
+- IMPACTO: 0 tokens extra (mismo budget, mejor contenido)
+- DEPENDENCIA: Requiere F1 (transcript correcto) para tener thinking de la sesión actual en turn_log
+
+##### Mapa de dependencias entre fixes
+
+```
+F1 (transcript correcto) ─────┐
+ │                             │
+ ├──→ F8 (response_text)      │
+ ├──→ F10 (thinking select.)  │
+ │                             │
+F2 (todas obs) ──→ F9 (agrupación)
+ │                  │
+ │                  └──→ F7 (eliminar overlap)
+ │
+F3 (todos prompts) — independiente
+F4 (filtrar auto-snap) — independiente
+F5 (plan/pending) — independiente
+F6 (resumen estructurado) — independiente
+```
+
+##### Impacto consolidado por nivel
+
+**Nivel 2 (startup) — post-fixes:**
+
+| Sección | Antes | Después |
+|---------|-------|---------|
+| Resumen | Último msg asistente (basura) | Estructurado (F6) |
+| Sesión anterior | Pendiente = build logs | Solo manual snapshots (F4) |
+| Estado guardado | Sin plan ni pending | Con plan + pending (F5) |
+| Thinking | Últimos 3 (superficiales) | Top 3 por keywords (F10) |
+| Acciones + Top | 2 secciones, ~100 tok overlap | 1 sección fusionada (F7) |
+| **Total** | **~640 tok, ~30% señal** | **~500-600 tok, ~70-80% señal** |
+
+**Nivel 3 (compact) — post-fixes:**
+
+| Sección | Antes | Después |
+|---------|-------|---------|
+| Observations | 10 de N, cwd global | TODAS de sesión actual, agrupadas (F2+F9) |
+| Prompts | 5 de N, cwd global | TODOS de sesión actual (F3) |
+| Thinking | 5 de OTRA sesión (BUG) | Clave de ESTA sesión (F1+F10) |
+| Responses | Nunca inyectado | Incluido en nivel 3 (F8) |
+| Plan/pending | Nunca inyectado | Incluido (F5) |
+| Overlap | 2 secciones redundantes | 1 sección "Actividad de esta sesión" (F7) |
+| **Total** | **~640 tok, ~15% de lo disponible** | **~800-1200 tok, ~90% de lo disponible** |
+
+##### Tabla de secciones por nivel (v0.8.0)
+
+| Sección | Nivel 1 | Nivel 2 | Nivel 3 |
+|---------|---------|---------|---------|
+| Resumen | 1-liner | estructurado (F6) | estructurado (F6) |
+| Cross-session | - | si, solo manual (F4) | si, solo manual (F4) |
+| Snapshot | tarea+paso | full + plan/pending (F5) | full + plan/pending (F5) |
+| Thinking | - | top 3 por keywords (F10) | top 5 keywords + responses (F8, F10) |
+| Prompts | 1 | 5 | TODOS sesión actual (F3) |
+| Actividad | - | relevante fusionada (F7) | TODA sesión agrupada (F2, F7, F9) |
+| Sesiones index | - | 3 | 1 |
 
 ### [0.6.0] — 2026-03-04
 #### Resiliencia Total de Contexto (5 componentes)
@@ -97,17 +328,31 @@
 
 ##### Cleanup extendido
 - ADD: `executeCleanup()` limpia tambien `turn_log` y `observation_scores`
-- ADD: turn_log retiene 30 dias por defecto (configurable)
-- ADD: DB growth estimado: 18MB/30 dias (5.6x vs actual). Con cleanup 30 dias en turn_log: ~10MB steady state
+- ADD: turn_log usa el mismo `olderThanDays` que las demas tablas (default 90 dias)
+- ADD: DB growth estimado: 18MB/30 dias (5.6x vs actual). Con cleanup default 90 dias: ~50MB steady state
 
 ##### Deuda tecnica nueva
 1. Thinking solo al cierre: si sesion crashea, thinking se pierde. Mitigation: auto-snapshots preservan estado
 2. Scoring estatico: no adapta pesos segun tipo de sesion. Planificado context-dependent scoring para v0.7
-3. Transcript size cap: 200KB puede no cubrir sesiones 4h+. Evaluar en uso real
+3. Transcript size cap: resuelto en v0.6.4 (20MB)
 
 ### [0.6.4] — 2026-03-05
 
-### [0.7.0] — 2026-03-05 (planned)
+### [0.7.1] — 2026-03-06
+#### Security hardening + bug fixes + refactor
+- ADD: `scripts/shared.mjs` — modulo compartido (`parseJsonSafe`, `formatTime`, `CONFIDENCE_LABELS`, `AUTO_SNAPSHOT_INTERVAL`)
+- CHANGE: `mkdirSync` con `mode: 0o700` para directorio de datos (S2)
+- CHANGE: `captureTechnicalState()` resuelve `tsc` desde `node_modules/typescript/bin/tsc` sin `npx` (S5), `bun test` via `execFileSync` sin shell
+- CHANGE: `technical_state` pasa por `redact()` antes de guardarse (S3)
+- CHANGE: `checkContextValidity()` usa `execFileSync('git', [...args])` (S4)
+- CHANGE: `findPreviousTranscript()` filtra por directorio del proyecto actual (S7)
+- CHANGE: `server.mjs` y `status.mjs` leen version de `package.json` (C1, C2)
+- CHANGE: `CONFIDENCE_LABELS` unificados via `shared.mjs` (C4)
+- FIX: `turnLogCutoff` hardcoded 30 dias → usa `olderThanDays` parametrizado (C5)
+- FIX: SPEC refs de "200KB" actualizadas a "20MB" (v0.6.4)
+- FIX: SPEC "10 tools" → "12 tools", conteo archivos 28 → 29
+
+### [0.7.0] — 2026-03-06
 #### Continuidad perfecta post-compact + Progressive Disclosure
 
 **Root cause**: Al compactar, Claude pierde plan, decisiones, razonamiento y punto de ejecucion. local-mem captura QUE hizo (tools) pero no QUE PENSO. No existe hook PreCompact. Ademas, el contexto inyectado es identico sin importar si es startup, compact o clear — desperdicia tokens o pierde informacion segun el caso.
@@ -181,7 +426,7 @@ No es un dump de `summary_text`. Es data estructurada de 5 tablas, ordenada por 
 - CHANGE: Acciones: 5 en nivel 2, 10 en nivel 3
 
 ##### Fase 2 — Captura en compact event
-- ADD: SessionStart(compact) descubre transcript via glob session_id.jsonl
+- ADD: SessionStart(compact) descubre transcript via `findPreviousTranscript(sessionId, cwd)` — filtrado por directorio del proyecto actual (evita cross-project context injection)
 - ADD: Lee ultimos 500KB, extrae 5 thinking + ultimo response -> turn_log
 - ADD: Inyecta en additionalContext inmediatamente
 
@@ -195,17 +440,19 @@ No es un dump de `summary_text`. Es data estructurada de 5 tablas, ordenada por 
 **Origen**: Analisis de la skill `/vibe_snapshot` — 3 features adoptables para local-mem.
 
 ###### 4a. Technical state en auto-snapshot
-- ADD: Al generar auto-snapshot (cada 25 obs), capturar estado tecnico del proyecto:
+- ADD: Al generar auto-snapshot (cada `AUTO_SNAPSHOT_INTERVAL` obs, definido en `shared.mjs`), capturar estado tecnico del proyecto:
   - `ts_errors`: cantidad de errores TypeScript (JS puro, sin dependencias de shell — cuenta lineas con `error TS` en stdout)
   - `test_summary`: resultado de tests (JS puro — extrae ultimas 3 lineas de stdout)
   - `lint_warnings`: warnings de lint si hay linter configurado
 - ADD: Nuevo campo `technical_state` (JSON) en tabla `execution_snapshots`
 - ADD: Schema migration v3→v4: `ALTER TABLE execution_snapshots ADD COLUMN technical_state TEXT`
 - ADD: Auto-snapshot corre los checks con timeout de 10s (sync, best-effort)
-- ADD: Deteccion automatica: solo corre `tsc` si existe `tsconfig.json`, solo corre `bun test` si existe directorio `tests/` o `__tests__/`
+- ADD: Deteccion automatica: solo corre `tsc` si existe `tsconfig.json` Y `node_modules/typescript/bin/tsc` (no usa `npx` — evita descargas silenciosas). Solo corre `bun test` si existe directorio `tests/` o `__tests__/`
+- ADD: `technical_state` pasa por `redact()` antes de guardarse (consistencia con el resto del pipeline)
+- ADD: `tsc` se ejecuta via `execFileSync(process.execPath, [tscPath, '--noEmit'])` — sin shell, sin PATH poisoning
 - RENDER: En cross-session curada: "Estado tecnico al cerrar: 3 TS errors, 1 test fallando" o "Estado tecnico al cerrar: limpio (0 errors, tests OK)"
-- NOTA: `tsc` y `bun test` salen con exit != 0 cuando hay errores/fallos — el catch parsea stdout/stderr para extraer datos igualmente. Solo se omite si el comando no existe (sin output de tsc real), no tiene output util, o excede el timeout de 10s. No es bloqueante.
-- NOTA: Solo se setea `ts_errors` si el output contiene patrones reales de tsc (`error TS`, `.ts(`, `.tsx(`). Esto evita reportar `ts_errors: 0` cuando npx/tsc no estan disponibles.
+- NOTA: `tsc` y `bun test` salen con exit != 0 cuando hay errores/fallos — el catch parsea stdout/stderr para extraer datos igualmente. Solo se omite si TypeScript no esta instalado localmente, no tiene output util, o excede el timeout de 10s. No es bloqueante.
+- NOTA: Solo se setea `ts_errors` si el output contiene patrones reales de tsc (`error TS`, `.ts(`, `.tsx(`). Esto evita reportar `ts_errors: 0` cuando tsc no esta disponible.
 - NOTA: Se aplica `.replace(/\r/g, '')` al output para normalizar line endings en Windows (CRLF → LF).
 
 ###### 4b. Confidence level en save_state
@@ -479,7 +726,7 @@ No es un dump de `summary_text`. Es data estructurada de 5 tablas, ordenada por 
 - ADD: Guardrails en `local_mem_cleanup` — minimo 7 dias, validacion de input, nunca borra sesion activa
 - ADD: Limite de tamano en stdin (MAX_STDIN_SIZE = 1MB) + timeout absoluto
 - ADD: Sanitizacion del contexto inyectado en SessionStart — delimitadores fuertes, tag `<local-mem-data>` explicito
-- ADD: Permisos explicitos de archivos — `chmod 700 data/`, `chmod 600 *.db*` en POSIX
+- ADD: Permisos explicitos de directorio — `mkdirSync({ mode: 0o700 })` protege `~/.local-mem/data/` en POSIX
 - ADD: Backup de settings.json antes de modificar en instalador
 - ADD: Escritura atomica de settings.json (write .tmp + rename)
 - ADD: Limite de respuesta en `local_mem_export` — max 500 registros por llamada, paginacion
@@ -564,13 +811,14 @@ local-mem/                          # Repositorio Git
     db.mjs                          # Modulo SQLite (bun:sqlite) - schema + queries + migrations
     redact.mjs                      # Modulo de redaccion de secrets
     stdin.mjs                       # Helper lectura stdin con limite de tamano
+    shared.mjs                      # Modulo compartido: parseJsonSafe, formatTime, CONFIDENCE_LABELS, AUTO_SNAPSHOT_INTERVAL
     session-start.mjs               # Hook SessionStart: inyecta contexto + cleanup huerfanas
     prompt-submit.mjs               # Hook UserPromptSubmit: graba prompt (redactado)
     observation.mjs                 # Hook PostToolUse: graba observacion (redactada)
     session-end.mjs                 # Hook SessionEnd: genera resumen, cierra sesion
     status.mjs                      # Health check: DB, hooks, MCP, ultima actividad
   mcp/
-    server.mjs                      # MCP Server (stdio, long-running) - 10 tools
+    server.mjs                      # MCP Server (stdio, long-running) - 12 tools
   docs/
     decisions/                      # Architecture Decision Records (ADRs)
       001-no-http-server.md         # Por que MCP stdio y no HTTP
@@ -1020,7 +1268,7 @@ getCleanupTargets(cwd, olderThanDays)      // preview: retorna conteo de registr
 executeCleanup(cwd, olderThanDays)         // borra registros + VACUUM si >100 borrados. NUNCA borra sesion active
                                            // ACTUALIZADO v0.6: tambien limpia turn_log (WHERE created_at < cutoff AND session NOT active)
                                            //   y observation_scores (WHERE observation_id IN deleted observations, via CASCADE)
-                                           //   turn_log retiene 30 dias por defecto
+                                           //   turn_log usa el mismo olderThanDays que las demas tablas
 getExportData(cwd, format, limit, offset)  // retorna datos + metadata {total, returned, offset, hasMore}
 
 // --- Status (1) ---
@@ -1450,9 +1698,9 @@ try {
 2. Valida campos requeridos (`session_id`)
 3. **Valida `transcript_path`**: Si se provee, verifica que sea un path absoluto y que no contenga traversal (`..`). Si falla la validacion, omite el transcript y genera resumen solo con metadata.
 4. Genera resumen hibrido:
-   - **Del transcript** (si `transcript_path` existe): lee los **ultimos 200KB** del JSONL (aumentado de 50KB en v0.6), extrae el ultimo mensaje de Claude (type=assistant) que suele contener un resumen natural. Lo limpia de system-reminders y lo guarda como `summary_text`. Si no hay resumen util, guarda null.
+   - **Del transcript** (si `transcript_path` existe): lee los **ultimos 20MB** del JSONL (aumentado de 200KB en v0.6.4), extrae el ultimo mensaje de Claude (type=assistant) que suele contener un resumen natural. Lo limpia de system-reminders y lo guarda como `summary_text`. Si no hay resumen util, guarda null.
    - **De las observaciones**: usa `observation_count` y `prompt_count` de la tabla `sessions` (counters incrementales, sin COUNT(*)), lista archivos unicos, calcula duracion.
-5. **v0.6 — Thinking capture**: Parsea TODAS las lineas del transcript (ultimos 200KB) una sola vez:
+5. **v0.6 — Thinking capture**: Parsea TODAS las lineas del transcript (ultimos 20MB, v0.6.4) una sola vez:
    - Para cada linea con `entry.type === 'assistant'`, inspecciona el array `content`
    - Extrae bloques `type: "thinking"` → `thinking_text`
    - Extrae bloques `type: "text"` → `response_text`
@@ -1477,10 +1725,10 @@ Servidor MCP via stdio (no HTTP), **long-running**. Claude Code lo spawna UNA VE
 Claude Code inicia
   → spawna: bun mcp/server.mjs
   → envia: initialize {protocolVersion: "2025-03-26"}
-  ← responde: {protocolVersion: "2025-03-26", capabilities: {tools: {}}, serverInfo: {name: "local-mem", version: "0.1.0"}}
+  ← responde: {protocolVersion: "2025-03-26", capabilities: {tools: {}}, serverInfo: {name: "local-mem", version: "<pkg.version>"}}
   → envia: notifications/initialized (sin id — NO responder)
   → envia: tools/list
-  ← responde: lista de 10 tools con descriptions y schemas
+  ← responde: lista de 12 tools con descriptions y schemas
   ... sesion activa ...
   → envia: tools/call (N veces)
   → envia: ping (periodicamente)
@@ -1678,8 +1926,8 @@ El MCP server abre la DB UNA VEZ al iniciar y la mantiene abierta. Ventajas:
 ### Persistencia y retencion:
 
 - TODO es permanente en SQLite (no hay archivos temporales)
-- La DB crece con el uso (~1KB por observacion, ~100 obs/sesion = ~100KB/sesion). **v0.6**: con turn_log + observation_scores + rich detail, DB growth estimado: ~18MB/30 dias (5.6x vs v0.5). Con cleanup de 30 dias en turn_log: ~10MB steady state
-- `cleanup` permite purgar datos antiguos bajo demanda (minimo 7 dias, preview por defecto). **v0.6**: tambien limpia `turn_log` (retencion 30 dias) y `observation_scores` (via CASCADE)
+- La DB crece con el uso (~1KB por observacion, ~100 obs/sesion = ~100KB/sesion). **v0.6**: con turn_log + observation_scores + rich detail, DB growth estimado: ~18MB/30 dias (5.6x vs v0.5)
+- `cleanup` permite purgar datos antiguos bajo demanda (minimo 7 dias, default 90, preview por defecto). **v0.6**: tambien limpia `turn_log` (mismo `olderThanDays` que las demas tablas) y `observation_scores` (via CASCADE)
 - `forget` permite borrar registros especificos (secrets accidentales)
 - El uninstall.mjs NO borra la DB (preserva datos)
 - Para borrar todo: Unix `rm -rf ~/.local-mem/data/` | Windows cmd `rmdir /s /q "%USERPROFILE%\.local-mem\data"` | PowerShell `Remove-Item -Recurse -Force "$env:USERPROFILE\.local-mem\data"`
@@ -1691,8 +1939,7 @@ El MCP server abre la DB UNA VEZ al iniciar y la mantiene abierta. Ventajas:
 Script interactivo que:
 
 1. Verifica que Bun esta instalado y version >= 1.1.0 (NO lo instala — pide al usuario si falta)
-2. Crea directorio `~/.local-mem/data/` si no existe
-3. **NUEVO (POSIX)**: Aplica `chmod 700` a `~/.local-mem/data/` y `chmod 600` a `*.db*`
+2. Crea directorio `~/.local-mem/data/` con `mode: 0o700` si no existe (POSIX: solo owner tiene acceso; Windows: no-op, NTFS ACLs del perfil ya protegen)
 4. Inicializa la DB con el schema
 5. Lee `~/.claude/settings.json`
 6. **NUEVO**: Crea backup `~/.claude/settings.json.bak` antes de modificar
@@ -1827,7 +2074,7 @@ Cloud sync:   WARNING — DB en directorio sincronizado con OneDrive
 
 ---
 
-## Archivos a crear (28 total)
+## Archivos a crear (29 total)
 
 | # | Archivo | Lineas aprox | Descripcion |
 |---|---------|-------------|-------------|
@@ -1842,10 +2089,11 @@ Cloud sync:   WARNING — DB en directorio sincronizado con OneDrive
 | 9 | `scripts/db.mjs` | ~560 | SQLite schema v2 + 24 funciones + FTS + migration v1→v2 + turn_log + observation_scores + normalizeCwd + counters |
 | 10 | `scripts/redact.mjs` | ~120 | 22 patrones + redactObject + sanitizeXml(&amp;) + truncate + isSensitiveFile (con .env.* pattern) |
 | 11 | `scripts/stdin.mjs` | ~40 | Helper stdin con limite 1MB + timeout absoluto |
+| 11b | `scripts/shared.mjs` | ~25 | Modulo compartido: `parseJsonSafe`, `formatTime`, `CONFIDENCE_LABELS`, `AUTO_SNAPSHOT_INTERVAL` |
 | 12 | `scripts/session-start.mjs` | ~180 | Hook contexto curado (hybrid index, ~800 tokens) + cleanup huerfanas + bienvenida + thinking display |
 | 13 | `scripts/prompt-submit.mjs` | ~40 | Hook graba prompts redactados |
 | 14 | `scripts/observation.mjs` | ~160 | Hook graba tool use con rich detail + auto-snapshot cada 25 obs + priority scoring |
-| 15 | `scripts/session-end.mjs` | ~140 | Hook SessionEnd: resumen + thinking capture (200KB transcript) + turn_log insert |
+| 15 | `scripts/session-end.mjs` | ~140 | Hook SessionEnd: resumen + thinking capture (20MB transcript) + turn_log insert |
 | 16 | `scripts/status.mjs` | ~60 | Health check completo |
 | 17 | `mcp/server.mjs` | ~720 | MCP Server long-running: 12 tools (+thinking_search, +top_priority), line buffer, ping, SIGTERM |
 | 18 | `tests/redact.test.mjs` | ~80 | Tests obligatorios para redaccion |
@@ -1977,7 +2225,7 @@ Cloud sync:   WARNING — DB en directorio sincronizado con OneDrive
    └─ Dispara hook SessionEnd (timeout 20s, v0.6)
       ├─ Lee stdin: {session_id, cwd, transcript_path}
       ├─ Valida transcript_path (no path traversal)
-      ├─ Lee transcript (ultimos 200KB, v0.6 — aumentado de 50KB)
+      ├─ Lee transcript (ultimos 20MB, v0.6.4 — aumentado de 200KB)
       ├─ Extrae thinking blocks de TODAS las lineas assistant → insertTurnLog() (v0.6)
       ├─ completeSession(session_id, summaryData)
       └─ process.exit(0)
@@ -2175,13 +2423,23 @@ Documentada para transparencia:
 5. **Transcript parsing fragil**: El hook SessionEnd extrae el ultimo mensaje de Claude del JSONL, que no siempre contiene un resumen util. Si no lo tiene, `summary_text` queda null (la metadata estructurada siempre se genera).
 6. **Redaccion por regex**: 22 patrones cubren providers principales pero no detecta secrets custom ni codificados en base64/hex. Documentado en ADR-008. Deteccion de entropia planificada para roadmap.
 7. **Permisos Windows**: `chmod` no aplica. ACLs via `icacls` no implementadas. El usuario debe asegurarse manualmente de que `%USERPROFILE%\.local-mem\data\` no este en directorio compartido. Documentado en SECURITY.md.
-7b. **Cross-platform shell commands**: `captureTechnicalState()` usa JS puro para parsear stdout de `tsc` y `bun test` (sin `grep`, `tail`, ni otros comandos Unix). Esto garantiza que funcione en Windows (cmd/PowerShell), Mac y Linux sin depender de que bash este en PATH. El mensaje de `uninstall.mjs` para borrar datos usa el comando apropiado segun la plataforma.
+7b. **Cross-platform shell commands**: `captureTechnicalState()` usa JS puro para parsear stdout de `tsc` y `bun test` (sin `grep`, `tail`, ni otros comandos Unix). `tsc` se resuelve desde `node_modules/typescript/bin/tsc` directamente (sin `npx`). Ambos (`tsc` y `bun test`) se ejecutan via `execFileSync` sin shell. `checkContextValidity()` usa `execFileSync('git', [...args])` sin interpolacion de strings. Esto garantiza que funcione en Windows (cmd/PowerShell), Mac y Linux sin depender de que bash este en PATH, y elimina vectores de command injection y descargas silenciosas via npx. El mensaje de `uninstall.mjs` para borrar datos usa el comando apropiado segun la plataforma.
 8. **Forget es hard-delete**: Sin soft-delete ni recovery. Si se borra por error, no hay forma de recuperar. Soft-delete planificado para v0.2.
 9. **MCP server persistent connection no usada directamente**: El module-level `const db = getDb()` sirve como WAL anchor pero cada funcion de db.mjs abre/cierra su propia conexion. Funcional pero no aprovecha la optimizacion de conexion persistente del SPEC. Planificado refactor para v0.2.
 10. **`redactObject()` sin depth limit**: Recursion sin WeakSet. Seguro en el codebase actual (solo recibe JSON parsed) pero fragil ante futuros callers. Agregar WeakSet en v0.2.
 11. **Thinking solo al cierre** (v0.6): Si la sesion crashea o el usuario cierra abruptamente, SessionEnd no se dispara y el thinking de esa sesion se pierde. Mitigacion: auto-snapshots preservan estado de la tarea cada 25 observaciones. Las observaciones individuales siempre se guardan via PostToolUse.
-12. **Scoring estatico** (v0.6): Los pesos del priority scoring (impact, recency, error) son fijos y no se adaptan al tipo de sesion (debug vs feature development). Planificado context-dependent scoring para v0.7.
-13. **Transcript size cap** (v0.6): Se leen los ultimos 200KB del transcript. En sesiones muy largas (4h+), esto puede no cubrir toda la sesion. Evaluar en uso real si necesita aumento.
+12. **Scoring estatico** (v0.6): Los pesos del priority scoring (impact, recency, error) son fijos y no se adaptan al tipo de sesion (debug vs feature development). Planificado context-dependent scoring para v0.9.
+13. **Transcript size cap**: SessionEnd lee hasta 20MB del transcript (aumentado de 200KB en v0.6.4). ~~SessionStart(compact) lee los ultimos 500KB~~ **Resuelto en v0.8.0 F1**: compact ahora lee hasta 2MB via `LAST_2MB` + param `maxBytes`.
+14. ~~**Compact lee transcript equivocado** (v0.7, BUG)~~: **Resuelto en v0.8.0 F1**: `findTranscript()` con `opts.includeCurrent` permite leer el transcript actual en compact.
+15. **Inyección trunca contexto de sesión actual** (v0.7): En nivel 3 (compact/resume), solo se inyectan 10 de N observations y 5 de N prompts. Se pierde ~85% del contexto de la sesión que se está compactando. Fix planificado en v0.8.0 F2+F3.
+16. ~~**Auto-snapshots contaminan cross-session** (v0.7)~~: **Resuelto en v0.8.0 F4**: `queryCuratedPrevSession()` nullifica `next_action`/`execution_point` de auto-snapshots. Campos útiles (`current_task`, `technical_state`) se preservan intencionalmente.
+17. ~~**Resumen basado en último mensaje** (v0.6)~~: **Resuelto en v0.8.0 F6**: `buildStructuredSummary()` desde datos DB (primero), fallback a `extractTranscriptSummary()` mejorada (filtra triviales <80 chars).
+18. ~~**Campos plan/pending_tasks no inyectados** (v0.7)~~: **Resuelto en v0.8.0 F5**: `plan` y `pending_tasks` se renderizan en "Estado guardado" con cap de 10 items y formato numerado.
+19. ~~**Overlap acciones/top relevancia** (v0.7)~~: **Resuelto en v0.8.0 F7/F9**: Secciones fusionadas en "Actividad relevante" (nivel 2) y "Actividad de esta sesión" (nivel 3). Sin duplicación.
+20. ~~**response_text nunca inyectado** (v0.6)~~: **Resuelto en v0.8.0 F8**: `response_text` se muestra en nivel 3 con prefijo "Respondió:", truncado a 300 chars.
+21. **No hay captura de conversación plain text** (v0.1): Mensajes del asistente sin tool use no se capturan en ninguna tabla. Solo se registran via transcript JSONL (que no siempre está disponible). Aceptado como limitación del hook system de Claude Code.
+22. ~~**pending_tasks sin truncate** (v0.8.0, menor)~~: **Resuelto**: `truncate(joined, 500)` aplicado.
+23. ~~**`getToolsAndFiles()` doble llamada** (v0.8.0, menor)~~: **Resuelto**: `buildStructuredSummary` recibe datos como parámetro.
 
 ---
 
@@ -2226,7 +2484,7 @@ Documentada para transparencia:
 |------|-----------|------|-------|---------------|
 | **1** | `scripts/db.mjs` | **Secuencial** | Todos los demas archivos importan funciones de db.mjs. Schema v2, migration, y nuevas funciones deben existir antes. | Migration v1→v2 transaccional, +4 funciones (insertTurnLog, searchThinking, getTopScoredObservations), getRecentContext actualizado, saveExecutionSnapshot con snapshot_type/task_status, executeCleanup extendido |
 | **2a** | `scripts/observation.mjs` | **Paralelo** | Solo depende de db.mjs (ya listo en fase 1). No tiene dependencias con otros scripts de fase 2. | distill() con tool_response (rich detail), computeScore() + insert en observation_scores, auto-snapshot cada 25 obs con prune |
-| **2b** | `scripts/session-end.mjs` | **Paralelo** | Solo depende de db.mjs (insertTurnLog). No lee ni modifica archivos de fase 2a/2c/2d. | Transcript 200KB, parseo completo de thinking blocks, insertTurnLog por cada turno assistant, timeout 20s |
+| **2b** | `scripts/session-end.mjs` | **Paralelo** | Solo depende de db.mjs (insertTurnLog). No lee ni modifica archivos de fase 2a/2c/2d. | Transcript 20MB, parseo completo de thinking blocks, insertTurnLog por cada turno assistant, timeout 20s |
 | **2c** | `scripts/session-start.mjs` | **Paralelo** | Solo depende de db.mjs (getRecentContext actualizado). No modifica archivos de fase 2a/2b/2d. | buildHistoricalContext() rediseñado: hybrid index ~800 tokens, secciones thinking/prompts/scored/indice |
 | **2d** | `install.mjs` | **Paralelo** | Cambio trivial (timeout 15→20). Sin dependencias con fase 2a/2b/2c. | SessionEnd timeout 20s en hook config |
 | **3** | `mcp/server.mjs` | **Secuencial** | Importa funciones de db.mjs y debe conocer el formato de respuesta de las nuevas funciones. Agrega 2 tools nuevas que usan searchThinking y getTopScoredObservations. | +thinking_search tool, +top_priority tool, save_state con task_status, tools/list actualizado a 12 |
@@ -2237,6 +2495,130 @@ Documentada para transparencia:
 - **Fases secuenciales**: 1 → 3 → 4 (3 fases criticas en serie)
 - **Fases paralelas**: 2a + 2b + 2c + 2d (4 archivos simultaneos)
 - **Total**: 4 fases, de las cuales 1 es paralela (4 archivos al mismo tiempo)
+
+---
+
+## Plan de implementacion v0.8.0
+
+### Grafo de dependencias
+
+```
+          ┌─────────────────────────────────────────────────┐
+          │              BATCH 1 — Independientes            │
+          │         (0 conflictos, paralelo total)           │
+          │                                                  │
+          │  F1: transcript    F4: filtrar     F5: plan/     │
+          │  correcto          auto-snap       pending       │
+          │  session-start     db.mjs          session-start │
+          │                                                  │
+          │  F6: resumen                                     │
+          │  estructurado                                    │
+          │  session-end                                     │
+          └───────────┬──────────────┬──────────────────────┘
+                      │              │
+          ┌───────────▼──────────────▼──────────────────────┐
+          │              BATCH 2 — Dependen de Batch 1       │
+          │                                                  │
+          │  F2: todas obs     F3: todos       F9: dedup/    │
+          │  sesión actual     prompts L3      agrupación    │
+          │  db.mjs            db.mjs          session-start │
+          │                                                  │
+          │  F2+F3 cambian getRecentContext() → hacer juntos │
+          │  F9 es el renderer que F2 necesita               │
+          └───────────┬─────────────────────────────────────┘
+                      │
+          ┌───────────▼─────────────────────────────────────┐
+          │              BATCH 3 — Dependen de Batch 1+2     │
+          │                                                  │
+          │  F7: eliminar      F8: response    F10: thinking │
+          │  overlap           text L3         selection     │
+          │  session-start     session-start   db.mjs +      │
+          │                                    session-start │
+          └─────────────────────────────────────────────────┘
+```
+
+### Detalle por batch
+
+| Batch | Fixes | Archivos | Tipo | Razón |
+|-------|-------|----------|------|-------|
+| **1** | F1, F4, F5, F6 | session-start, db, session-end | **Paralelo** | Sin dependencias entre sí. Cada uno toca funciones distintas. |
+| **2** | F2, F3, F9 | db, session-start | **Semi-paralelo** | F2+F3 modifican `getRecentContext()` (hacerlos juntos). F9 es nuevo renderer independiente. |
+| **3** | F7, F8, F10 | db, session-start | **Semi-paralelo** | F7 necesita F2+F9 para saber cómo renderizar nivel 3. F8 necesita F1 para datos correctos. F10 necesita F1 para thinking en turn_log. |
+
+### Resumen de cambios por archivo
+
+| Archivo | Fixes que lo tocan | Cambios clave |
+|---------|-------------------|---------------|
+| `scripts/db.mjs` | F2, F3, F4, F10 | `getRecentContext()` con session_id para nivel 3, `queryCuratedPrevSession()` solo manual, `getKeyThinking()` nueva |
+| `scripts/session-start.mjs` | F1, F2, F5, F7, F8, F9 | `findTranscript()` con `opts.current`, `renderGroupedObservations()`, plan/pending render, fusión acciones/top, response_text en nivel 3 |
+| `scripts/session-end.mjs` | F6 | `buildStructuredSummary()` nueva, fallback a `extractTranscriptSummary()` |
+
+### Ejecución Batch 1 — Asignación de agentes
+
+**Restricción clave**: F1 y F5 tocan el mismo archivo (`session-start.mjs`). Si se ejecutan en worktrees paralelos, habrá conflictos de merge. Van juntos en un agente.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    3 AGENTES EN PARALELO                     │
+│                                                              │
+│  ┌─────────────────┐ ┌──────────────┐ ┌──────────────────┐  │
+│  │ A1: F1 + F5     │ │ A2: F4       │ │ A3: F6           │  │
+│  │ session-start   │ │ db.mjs       │ │ session-end.mjs  │  │
+│  │ .mjs            │ │              │ │                  │  │
+│  │                 │ │ 1 worker     │ │ 1 worker         │  │
+│  │ 1 worker        │ │ Complejidad: │ │ Complejidad:     │  │
+│  │ Complejidad:    │ │ Media        │ │ Media            │  │
+│  │ Alta            │ └──────────────┘ └──────────────────┘  │
+│  └─────────────────┘                                         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+| Agente | Fixes | Archivo | Qué hace | Orden interno |
+|--------|-------|---------|----------|---------------|
+| **A1** | F1 + F5 | `session-start.mjs` | F5 primero (render `plan`/`pending_tasks` en L247-283), luego F1 (fix `findPreviousTranscript()` L404-458 + bloque compact L534-554) | Secuencial |
+| **A2** | F4 | `db.mjs` | Filtrar auto-snapshots en `queryCuratedPrevSession()` L702-737, limpiar snapshot query L600-607 | Único |
+| **A3** | F6 | `session-end.mjs` | Reescribir `extractTranscriptSummary()` L9-57 con extracción estructurada | Único |
+
+**Detalle de cambios por agente:**
+
+**A1 — F5 (render plan/pending)**:
+- En `buildHistoricalContext()` L257-283, después de `next_action`, agregar:
+  - `snapshot.plan` → `- Plan: <contenido>`
+  - `snapshot.pending_tasks` → `- Tareas pendientes: <items>`
+- Edge case: ambos campos son JSON stringified, usar `parseJsonSafe()`
+
+**A1 — F1 (transcript correcto en compact)**:
+- `findPreviousTranscript()` L404-458: el bug es `if (sessionId === currentSessionId) continue` — en compact, el transcript actual ES el que queremos
+- Opciones: (a) aceptar parámetro `opts.includeCurrent`, (b) función separada `findCurrentTranscript()`
+- Bloque compact L534-554: adaptar para usar transcript actual
+- Edge case: verificar que el JSONL tenga contenido suficiente (no solo 2-3 líneas de inicio de sesión)
+
+**A2 — F4 (filtrar auto-snapshots)**:
+- `queryCuratedPrevSession()` L702-737: agregar `AND es.snapshot_type = 'manual'` o `AND (es.snapshot_type = 'manual' OR es.next_action NOT LIKE 'Auto-snapshot%')`
+- Query de snapshot general L600-607: si el resultado es auto-snapshot, nullificar `next_action` y `execution_point` (contienen datos raw)
+- Edge case: sesión previa SIN manual snapshot → mostrar solo `current_task` del auto, no `next_action`
+
+**A3 — F6 (resumen estructurado)**:
+- Reemplazar lógica "último mensaje assistant" por búsqueda de contenido significativo
+- Heurística: buscar mensajes con >100 chars que NO sean solo "Perfecto", "Listo", "Ok"
+- Fallback: si no hay mensaje significativo, generar resumen desde observations (tools + files)
+- Output: string estructurado tipo "Implementó X en archivo Y. Resultado: Z"
+
+### Criterio de aceptación
+
+- Nivel 3 (compact) inyecta TODAS las observations de la sesión actual
+- Nivel 3 inyecta TODOS los prompts de la sesión actual
+- Nivel 3 captura thinking de la sesión ACTUAL (no de otra)
+- Cross-session "Pendiente" nunca muestra datos de auto-snapshots
+- Resumen siempre contiene información estructurada (no "Perfecto, queda así")
+- No hay secciones duplicadas en el output
+- Los campos `plan` y `pending_tasks` del snapshot se muestran cuando existen
+
+### Roadmap futuro (post v0.8.0)
+
+- **Project DNA**: Tabla `project_profile` con stack, patrones, key_files detectados cross-sesión. ~50-80 tokens fijos que ahorran cientos en cada sesión.
+- **Budget-aware rendering**: Token budget configurable. Secciones llenan de mayor a menor prioridad hasta agotar budget.
+- **Resumen con IA (opt-in)**: En session-end, usar el propio Claude para generar resumen semántico de 2-3 frases.
 
 ---
 

@@ -206,7 +206,7 @@ export function getDb(dbPath) {
 
   const dir = dirname(resolvedPath);
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
   } catch {}
   const db = new Database(resolvedPath, { create: true });
   db.exec('PRAGMA journal_mode=WAL');
@@ -529,6 +529,87 @@ export function searchThinking(query, cwd, opts = {}) {
   }
 }
 
+/**
+ * Selecciona thinking blocks relevantes usando FTS5 keywords.
+ * Prioriza bloques con decisiones/razonamiento sobre los operativos.
+ * Fallback: más recientes si FTS no encuentra suficientes.
+ */
+export function getKeyThinking(cwd, sessionId, limit = 5) {
+  const db = getDb();
+  const nCwd = normalizeCwd(cwd);
+  try {
+    // Sanitize each keyword individually, then join with OR (sanitizeFtsQuery strips OR)
+    const DECISION_TERMS = [
+      'decidí', 'decided', 'opté', 'chose', 'plan', 'trade-off',
+      'porque', 'because', 'problema', 'problem', 'solución', 'solution',
+      'estrategia', 'strategy', 'alternativa', 'alternative', 'tradeoff',
+      'razón', 'reason'
+    ];
+    const ftsQuery = DECISION_TERMS.map(t => t.replace(/['"(){}[\]^~*:]/g, '')).filter(Boolean).join(' OR ');
+
+    // 1. FTS5 search for decision-bearing thinking
+    let ftsResults = [];
+    try {
+      if (ftsQuery) {
+        const whereClause = sessionId
+          ? 'AND t.session_id = ? AND t.cwd = ?'
+          : 'AND t.cwd = ?';
+        const params = sessionId
+          ? [ftsQuery, sessionId, nCwd, limit]
+          : [ftsQuery, nCwd, limit];
+        ftsResults = db.prepare(`
+          SELECT t.thinking_text, t.response_text, t.created_at
+          FROM turn_fts f
+          JOIN turn_log t ON t.id = f.rowid
+          WHERE turn_fts MATCH ? ${whereClause}
+            AND length(t.thinking_text) >= 50
+          ORDER BY t.created_at DESC
+          LIMIT ?
+        `).all(...params);
+      }
+    } catch { /* FTS can fail on corrupted index — fallback below */ }
+
+    // 2. If FTS found enough, return sorted chronologically
+    if (ftsResults.length >= limit) {
+      return ftsResults.slice(0, limit).sort((a, b) => a.created_at - b.created_at);
+    }
+
+    // 3. Fallback: fill remaining slots with most recent (excluding duplicates)
+    const ftsIds = new Set(ftsResults.map(r => `${r.created_at}_${(r.thinking_text || '').slice(0, 50)}`));
+    const remaining = limit - ftsResults.length;
+
+    const whereClause = sessionId
+      ? 'WHERE t.session_id = ? AND t.cwd = ?'
+      : 'WHERE t.cwd = ?';
+    const params = sessionId
+      ? [sessionId, nCwd, remaining + ftsResults.length]
+      : [nCwd, remaining + ftsResults.length];
+
+    const recentRows = db.prepare(`
+      SELECT t.thinking_text, t.response_text, t.created_at
+      FROM turn_log t
+      ${whereClause}
+      ORDER BY t.created_at DESC
+      LIMIT ?
+    `).all(...params);
+
+    // Merge: FTS results + recent (deduplicated)
+    const merged = [...ftsResults];
+    for (const row of recentRows) {
+      const key = `${row.created_at}_${(row.thinking_text || '').slice(0, 50)}`;
+      if (!ftsIds.has(key) && merged.length < limit) {
+        merged.push(row);
+        ftsIds.add(key);
+      }
+    }
+
+    // Sort chronologically
+    return merged.sort((a, b) => a.created_at - b.created_at);
+  } finally {
+    db.close();
+  }
+}
+
 // Recency band applied at query-time: base_score + 0.3 * CASE(age)
 const RECENCY_SQL = `(s.composite_score + 0.3 * CASE
   WHEN (unixepoch() - o.created_at) < 3600 THEN 1.0
@@ -621,52 +702,83 @@ export function getRecentContext(cwd, opts = {}) {
     }
 
     // === Nivel 2+: contexto completo ===
-    const promptLimit = 5;
-    const obsLimit = level === 3 ? 10 : 5;
     const topLimit = level === 3 ? 10 : 7;
 
-    const observations = db.prepare(`
-      SELECT o.id, o.tool_name, o.action, o.files, o.detail, o.cwd, o.created_at
-      FROM observations o WHERE o.cwd = ?
-      ORDER BY o.created_at DESC LIMIT ?
-    `).all(nCwd, obsLimit);
-
-    // Thinking blocks (viejo→nuevo para contexto): nivel 2 = 3, nivel 3 = 5
-    const thinkingLimit = level === 3 ? 5 : 3;
-    const thinkingRows = db.prepare(`
-      SELECT thinking_text, response_text, created_at
-      FROM turn_log WHERE cwd = ?
-      ORDER BY created_at DESC LIMIT ?
-    `).all(nCwd, thinkingLimit);
-    const thinking = thinkingRows.length > 0 ? thinkingRows.reverse() : null;
-
-    // Top observaciones por score con threshold dinamico
-    const allScored = db.prepare(`
-      WITH scored AS (
-        SELECT o.id, o.tool_name, o.action, o.created_at,
-               ${RECENCY_SQL} AS composite_score
-        FROM observation_scores s
-        JOIN observations o ON o.id = s.observation_id
-        WHERE o.cwd = ?
-      )
-      SELECT * FROM scored
-      ORDER BY composite_score DESC
-      LIMIT 30
-    `).all(nCwd);
-    const threshold = getThreshold(allScored.map(r => r.composite_score));
-    let topScored = allScored.filter(r => r.composite_score >= threshold);
-    if (topScored.length < 5 && allScored.length >= 5) {
-      topScored = allScored.slice(0, 5);
+    // Sesión activa para nivel 3 (reutilizada en F2+F3)
+    let activeSessionId = null;
+    if (level === 3) {
+      const activeRow = db.prepare(`
+        SELECT session_id FROM sessions
+        WHERE cwd = ? AND status = 'active'
+        ORDER BY started_at DESC LIMIT 1
+      `).get(nCwd);
+      activeSessionId = activeRow ? activeRow.session_id : null;
     }
-    topScored = topScored.slice(0, topLimit);
 
-    const prompts = db.prepare(`
-      SELECT p.prompt_text, p.created_at
-      FROM user_prompts p
-      JOIN sessions s ON s.session_id = p.session_id
-      WHERE s.cwd = ?
-      ORDER BY p.created_at DESC LIMIT ?
-    `).all(nCwd, promptLimit);
+    let observations;
+    if (level === 3 && activeSessionId) {
+      // F2: TODAS las obs de la sesión actual, cronológico (safety net: 200)
+      observations = db.prepare(`
+        SELECT o.id, o.tool_name, o.action, o.files, o.detail, o.cwd, o.created_at
+        FROM observations o WHERE o.session_id = ?
+        ORDER BY o.created_at ASC LIMIT 200
+      `).all(activeSessionId);
+    } else {
+      const obsLimit = level === 3 ? 10 : 5;
+      observations = db.prepare(`
+        SELECT o.id, o.tool_name, o.action, o.files, o.detail, o.cwd, o.created_at
+        FROM observations o WHERE o.cwd = ?
+        ORDER BY o.created_at DESC LIMIT ?
+      `).all(nCwd, obsLimit);
+    }
+
+    // Thinking blocks: FTS5 selection (F10) con fallback reciente
+    const thinkingLimit = level === 3 ? 5 : 3;
+    const thinkingSessionId = (level === 3 && activeSessionId) ? activeSessionId : null;
+    const thinkingRows = getKeyThinking(nCwd, thinkingSessionId, thinkingLimit);
+    const thinking = thinkingRows.length > 0 ? thinkingRows : null;
+
+    // Top observaciones por score con threshold dinamico (skip en nivel 3 — no se renderiza)
+    let topScored = [];
+    if (level !== 3) {
+      const allScored = db.prepare(`
+        WITH scored AS (
+          SELECT o.id, o.tool_name, o.action, o.created_at,
+                 ${RECENCY_SQL} AS composite_score
+          FROM observation_scores s
+          JOIN observations o ON o.id = s.observation_id
+          WHERE o.cwd = ?
+        )
+        SELECT * FROM scored
+        ORDER BY composite_score DESC
+        LIMIT 30
+      `).all(nCwd);
+      const threshold = getThreshold(allScored.map(r => r.composite_score));
+      topScored = allScored.filter(r => r.composite_score >= threshold);
+      if (topScored.length < 5 && allScored.length >= 5) {
+        topScored = allScored.slice(0, 5);
+      }
+      topScored = topScored.slice(0, topLimit);
+    }
+
+    let prompts;
+    if (level === 3 && activeSessionId) {
+      // F3: TODOS los prompts de la sesión actual, cronológico (cap: 50)
+      prompts = db.prepare(`
+        SELECT p.prompt_text, p.created_at
+        FROM user_prompts p WHERE p.session_id = ?
+        ORDER BY p.created_at ASC LIMIT 50
+      `).all(activeSessionId);
+    } else {
+      const promptLimit = 5;
+      prompts = db.prepare(`
+        SELECT p.prompt_text, p.created_at
+        FROM user_prompts p
+        JOIN sessions s ON s.session_id = p.session_id
+        WHERE s.cwd = ?
+        ORDER BY p.created_at DESC LIMIT ?
+      `).all(nCwd, promptLimit);
+    }
 
     // Sesiones index: nivel 2 = 3, nivel 3 = 1
     const sessionIndexLimit = level === 3 ? 1 : 3;
@@ -712,7 +824,8 @@ function queryCuratedPrevSession(db, nCwd) {
       ps.status,
       ps.observation_count,
       es.current_task,
-      es.next_action,
+      CASE WHEN es.snapshot_type = 'auto' THEN NULL ELSE es.next_action END AS next_action,
+      CASE WHEN es.snapshot_type = 'auto' THEN NULL ELSE es.execution_point END AS execution_point,
       es.open_decisions,
       es.blocking_issues,
       es.active_files,
@@ -1001,13 +1114,11 @@ export function getCleanupTargets(cwd, olderThanDays) {
         AND session_id NOT IN (SELECT session_id FROM sessions WHERE status = 'active')
     `).get(nCwd, cutoff);
 
-    // v0.6: turn_log (30 dias default)
-    const turnLogCutoff = 30 * 86400;
     const turnLogs = db.prepare(`
       SELECT COUNT(*) as count FROM turn_log
       WHERE cwd = ? AND created_at < unixepoch() - ?
         AND session_id NOT IN (SELECT session_id FROM sessions WHERE status = 'active')
-    `).get(nCwd, turnLogCutoff);
+    `).get(nCwd, cutoff);
 
     return {
       observations: obs.count,
@@ -1059,13 +1170,11 @@ export function executeCleanup(cwd, olderThanDays) {
       `).run(nCwd, cutoff);
       summariesDeleted = r4.changes;
 
-      // v0.6: cleanup turn_log (30 dias retention)
-      const turnLogCutoff = 30 * 86400;
       const r5 = db.prepare(`
         DELETE FROM turn_log
         WHERE cwd = ? AND created_at < unixepoch() - ?
           AND session_id NOT IN (SELECT session_id FROM sessions WHERE status = 'active')
-      `).run(nCwd, turnLogCutoff);
+      `).run(nCwd, cutoff);
       turnLogsDeleted = r5.changes;
 
       // v0.6: observation_scores cleaned via CASCADE on observations delete
