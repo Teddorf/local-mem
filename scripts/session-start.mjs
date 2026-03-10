@@ -8,6 +8,7 @@ import {
   abandonOrphanSessions,
   ensureSession,
   getRecentContext,
+  getProjectDna,
   insertTurnLog,
 } from './db.mjs';
 import { sanitizeXml, truncate, redact } from './redact.mjs';
@@ -242,7 +243,7 @@ export function renderGroupedObservations(lines, observations, maxLines) {
   }
 }
 
-function buildHistoricalContext(project, ctx, source, level) {
+function buildHistoricalContext(project, ctx, source, level, cwd) {
   const { observations, summary, snapshot, thinking, topScored, prompts,
           recentSessions, prevSession, prevActions } = ctx;
 
@@ -257,6 +258,18 @@ function buildHistoricalContext(project, ctx, source, level) {
 
   const levelLabel = level === 1 ? 'contexto minimo' : level === 3 ? 'contexto reciente (recovery)' : 'contexto reciente';
   lines.push(`# ${sanitizeXml(project)} — ${levelLabel}`);
+
+  // Project DNA
+  if (level >= 2) {
+    const dna = getProjectDna(cwd || '');
+    if (dna && (dna.stack.length > 0 || dna.patterns.length > 0)) {
+      const parts = [];
+      if (dna.stack.length > 0) parts.push(dna.stack.join(' + '));
+      if (dna.patterns.length > 0) parts.push(dna.patterns.join(', '));
+      if (dna.key_files.length > 0) parts.push(`Key: ${dna.key_files.slice(0, 5).join(', ')}`);
+      lines.push(`DNA: ${parts.join(' | ')}`);
+    }
+  }
 
   // --- Ultimo resumen ---
   if (summary) {
@@ -666,7 +679,7 @@ async function main() {
   if (observations.length === 0 && !summary && !snapshot) {
     markdown = buildWelcomeContext();
   } else {
-    markdown = buildHistoricalContext(project, ctx, source, level);
+    markdown = buildHistoricalContext(project, ctx, source, level, cwd);
   }
 
   // Fase 2.3: Inject fresh compact thinking blocks if DB didn't have them yet

@@ -337,6 +337,31 @@ export function getDb(dbPath) {
     }
   }
 
+  if (currentVersion < 5) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // v0.9 Project DNA: per-project identity profile
+      db.exec(`CREATE TABLE IF NOT EXISTS project_profile (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cwd TEXT UNIQUE NOT NULL,
+        stack TEXT,
+        patterns TEXT,
+        key_files TEXT,
+        conventions TEXT,
+        updated_at INTEGER NOT NULL,
+        source TEXT CHECK(source IN ('auto','manual')) DEFAULT 'auto'
+      )`);
+
+      db.exec(`UPDATE schema_version SET version=5, applied_at=unixepoch() WHERE rowid=1`);
+
+      db.exec('COMMIT');
+      process.stderr.write('[local-mem] Migration v4→v5 applied\n');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw new Error(`Migration v4→v5 failed: ${e.message}`);
+    }
+  }
+
   return db;
 }
 
@@ -867,6 +892,115 @@ function queryPrevHighImpactActions(db, nCwd) {
     ORDER BY s.composite_score DESC
     LIMIT ${SCORING.PREV_HIGH_IMPACT_LIMIT}
   `).all(nCwd);
+}
+
+// ─── Project DNA ─────────────────────────────────────────────────────────────
+
+export function getProjectDna(cwd) {
+  const db = getDb();
+  const nCwd = normalizeCwd(cwd);
+  try {
+    const row = db.prepare(`
+      SELECT stack, patterns, key_files, conventions, updated_at, source
+      FROM project_profile WHERE cwd = ?
+    `).get(nCwd);
+    if (!row) return null;
+    return {
+      stack: row.stack ? JSON.parse(row.stack) : [],
+      patterns: row.patterns ? JSON.parse(row.patterns) : [],
+      key_files: row.key_files ? JSON.parse(row.key_files) : [],
+      conventions: row.conventions || '',
+      updated_at: row.updated_at,
+      source: row.source,
+    };
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+export function updateProjectDna(cwd, detected) {
+  const db = getDb();
+  const nCwd = normalizeCwd(cwd);
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // Never overwrite manual entries
+      const existing = db.prepare(`
+        SELECT stack, patterns, key_files, source FROM project_profile WHERE cwd = ?
+      `).get(nCwd);
+
+      if (existing && existing.source === 'manual') {
+        db.exec('COMMIT');
+        return;
+      }
+
+      // Merge with existing auto data (union of sets)
+      let stack = new Set(detected.stack || []);
+      let patterns = new Set(detected.patterns || []);
+      let key_files = new Set(detected.key_files || []);
+
+      if (existing) {
+        try {
+          const oldStack = JSON.parse(existing.stack || '[]');
+          const oldPatterns = JSON.parse(existing.patterns || '[]');
+          const oldKeyFiles = JSON.parse(existing.key_files || '[]');
+          for (const s of oldStack) stack.add(s);
+          for (const p of oldPatterns) patterns.add(p);
+          for (const f of oldKeyFiles) key_files.add(f);
+        } catch { /* corrupted JSON — start fresh */ }
+      }
+
+      db.prepare(`
+        INSERT INTO project_profile (cwd, stack, patterns, key_files, conventions, updated_at, source)
+        VALUES (?, ?, ?, ?, ?, unixepoch(), 'auto')
+        ON CONFLICT(cwd) DO UPDATE SET
+          stack = excluded.stack,
+          patterns = excluded.patterns,
+          key_files = excluded.key_files,
+          updated_at = excluded.updated_at
+      `).run(
+        nCwd,
+        JSON.stringify([...stack]),
+        JSON.stringify([...patterns]),
+        JSON.stringify([...key_files]),
+        detected.conventions || null
+      );
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export function setProjectDna(cwd, data) {
+  const db = getDb();
+  const nCwd = normalizeCwd(cwd);
+  try {
+    db.prepare(`
+      INSERT INTO project_profile (cwd, stack, patterns, key_files, conventions, updated_at, source)
+      VALUES (?, ?, ?, ?, ?, unixepoch(), 'manual')
+      ON CONFLICT(cwd) DO UPDATE SET
+        stack = excluded.stack,
+        patterns = excluded.patterns,
+        key_files = excluded.key_files,
+        conventions = excluded.conventions,
+        updated_at = excluded.updated_at,
+        source = 'manual'
+    `).run(
+      nCwd,
+      JSON.stringify(data.stack || []),
+      JSON.stringify(data.patterns || []),
+      JSON.stringify(data.key_files || []),
+      data.conventions || null
+    );
+  } finally {
+    db.close();
+  }
 }
 
 export function pruneAutoSnapshots(sessionId, cwd, maxKeep = 3) {

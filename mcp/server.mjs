@@ -19,6 +19,8 @@ import {
   getLatestSnapshot,
   getStatusData,
   closeDb,
+  getProjectDna,
+  setProjectDna,
 } from '../scripts/db.mjs';
 
 import { readFileSync } from 'node:fs';
@@ -264,6 +266,21 @@ const TOOLS = [
         },
         limit: { type: 'number', description: 'Max results (default 15, max 50)', default: 15 },
       },
+    },
+  },
+  {
+    name: 'project_dna',
+    description: 'Get or set the project DNA (stack, patterns, key files). Without parameters returns current DNA. With parameters sets manual DNA that auto-detect cannot overwrite.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string', description: 'Project working directory (required)' },
+        stack: { type: 'array', items: { type: 'string' }, description: 'Tech stack (e.g. ["Bun", "SQLite", "TypeScript"])' },
+        patterns: { type: 'array', items: { type: 'string' }, description: 'Project patterns (e.g. ["zero-deps", "FTS5"])' },
+        key_files: { type: 'array', items: { type: 'string' }, description: 'Key files (e.g. ["db.mjs", "server.mjs"])' },
+        conventions: { type: 'string', description: 'Project conventions (e.g. "español, conciso")' },
+      },
+      required: ['cwd'],
     },
   },
 ];
@@ -728,6 +745,24 @@ async function executeTool(name, params) {
       const limit = Math.min(Math.max(parseInt(params.limit, 10) || MCP.TOP_PRIORITY_LIMIT, 1), 50);
       const results = getTopScoredObservations(cwd, { minScore, limit });
       return toolResult(results);
+    }
+
+    // ---- project_dna ----
+    case 'project_dna': {
+      const { cwd, stack, patterns, key_files, conventions } = params;
+      if (!cwd) return toolError('cwd is required');
+
+      // If any data params provided, set manual DNA
+      if (stack !== undefined || patterns !== undefined || key_files !== undefined || conventions !== undefined) {
+        setProjectDna(cwd, { stack, patterns, key_files, conventions });
+        const dna = getProjectDna(cwd);
+        return toolResult(`Project DNA set (manual):\n- Stack: ${(dna?.stack || []).join(', ')}\n- Patterns: ${(dna?.patterns || []).join(', ')}\n- Key files: ${(dna?.key_files || []).join(', ')}\n- Conventions: ${dna?.conventions || '(none)'}`);
+      }
+
+      // Otherwise, get current DNA
+      const dna = getProjectDna(cwd);
+      if (!dna) return toolResult('No Project DNA found for this project. It will be auto-detected after the first session.');
+      return toolResult(`Project DNA (${dna.source}):\n- Stack: ${dna.stack.join(', ') || '(none)'}\n- Patterns: ${dna.patterns.join(', ') || '(none)'}\n- Key files: ${dna.key_files.join(', ') || '(none)'}\n- Conventions: ${dna.conventions || '(none)'}\n- Updated: ${new Date(dna.updated_at * 1000).toISOString()}`);
     }
 
     default:

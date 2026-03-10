@@ -1,11 +1,57 @@
 import { readFileSync } from 'fs';
 import { basename, isAbsolute } from 'path';
 import { readStdin } from './stdin.mjs';
-import { getDb, completeSession, getSessionStats, normalizeCwd, insertTurnLog } from './db.mjs';
+import { getDb, completeSession, getSessionStats, normalizeCwd, insertTurnLog, updateProjectDna } from './db.mjs';
 import { redact } from './redact.mjs';
 import { SIZES, TRUNCATE, RENDER } from './constants.mjs';
 
 const LAST_200KB = SIZES.TRANSCRIPT_MAX_END;
+
+export function inferProjectDna(toolsUsed, filesModified, filesRead, bashActions) {
+  const stackSet = new Set();
+  const patterns = [];
+  const keyFilesSet = new Set();
+
+  const allFiles = [...(filesModified || []), ...(filesRead || [])];
+
+  for (const f of allFiles) {
+    if (!f || typeof f !== 'string') continue;
+    const lower = f.toLowerCase();
+    const base = basename(f);
+
+    if (lower.endsWith('.ts') || lower.endsWith('.d.ts')) stackSet.add('TypeScript');
+    if (lower.endsWith('.mjs')) stackSet.add('ESM');
+    if (lower.endsWith('.py')) stackSet.add('Python');
+    if (lower.endsWith('.rs')) stackSet.add('Rust');
+    if (lower.endsWith('.go')) stackSet.add('Go');
+    if (lower.endsWith('.jsx') || lower.endsWith('.tsx')) stackSet.add('React');
+    if (lower.endsWith('.vue')) stackSet.add('Vue');
+    if (lower.endsWith('.svelte')) stackSet.add('Svelte');
+    if (lower.endsWith('.sql') || lower.includes('sqlite')) stackSet.add('SQLite');
+    if (lower.includes('docker') || base === 'Dockerfile') stackSet.add('Docker');
+  }
+
+  // Detect from Bash tool actions
+  if (Array.isArray(bashActions)) {
+    const joined = bashActions.join(' ').toLowerCase();
+    if (/\bbun\b/.test(joined)) stackSet.add('Bun');
+    if (/\bnpm\b/.test(joined) || /\byarn\b/.test(joined) || /\bpnpm\b/.test(joined)) stackSet.add('Node.js');
+  }
+
+  // Collect key_files from modified files (basenames, deduplicated, max 10)
+  for (const f of (filesModified || [])) {
+    if (f && typeof f === 'string') {
+      keyFilesSet.add(basename(f));
+      if (keyFilesSet.size >= RENDER.MAX_KEY_FILES_DETECT) break;
+    }
+  }
+
+  return {
+    stack: [...stackSet],
+    patterns,
+    key_files: [...keyFilesSet]
+  };
+}
 
 function extractTranscriptSummary(transcriptPath) {
   try {
@@ -185,10 +231,12 @@ function getToolsAndFiles(sessionId) {
     const toolsCounts = {};
     const filesRead = new Set();
     const filesModified = new Set();
+    const bashActions = [];
 
     const WRITE_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
     for (const row of rows) {
       if (row.tool_name) toolsCounts[row.tool_name] = (toolsCounts[row.tool_name] || 0) + 1;
+      if (row.tool_name === 'Bash' && row.action) bashActions.push(row.action);
       if (row.files) {
         let files;
         try { files = JSON.parse(row.files); } catch { files = [row.files]; }
@@ -206,7 +254,8 @@ function getToolsAndFiles(sessionId) {
     return {
       tools_used: toolsCounts,
       files_read: [...filesRead],
-      files_modified: [...filesModified]
+      files_modified: [...filesModified],
+      bash_actions: bashActions
     };
   } finally {
     db.close();
@@ -236,7 +285,7 @@ async function main() {
     }
 
     const stats = getSessionStats(session_id);
-    const { tools_used, files_read, files_modified } = getToolsAndFiles(session_id);
+    const { tools_used, files_read, files_modified, bash_actions } = getToolsAndFiles(session_id);
 
     // Intentar resumen estructurado primero (datos DB) — reutiliza tools/files ya extraídos
     summaryText = buildStructuredSummary(session_id, cwd, { tools_used, files_modified });
@@ -279,6 +328,15 @@ async function main() {
       prompt_count: promptCount,
       duration_seconds: durationSeconds
     });
+
+    if (obsCount > 0) {
+      try {
+        const detected = inferProjectDna(tools_used, files_modified, files_read, bash_actions);
+        if (detected.stack.length > 0 || detected.key_files.length > 0) {
+          updateProjectDna(cwd, detected);
+        }
+      } catch { /* best-effort */ }
+    }
 
     process.stdout.write('Success\n');
     process.exit(0);

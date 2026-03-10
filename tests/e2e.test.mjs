@@ -95,10 +95,10 @@ describe('db.mjs — Core CRUD', () => {
 
   // --- getDb / schema ---
   describe('getDb() — schema and connection', () => {
-    test('creates DB and applies schema v4', () => {
+    test('creates DB and applies schema v5', () => {
       const db = getDb();
       const row = db.prepare('SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1').get();
-      expect(row.version).toBe(4);
+      expect(row.version).toBe(5);
     });
 
     test('returns same singleton on repeated calls', () => {
@@ -831,7 +831,7 @@ describe('db.mjs — Cleanup & Export', () => {
       const status = getStatusData(TEST_CWD);
       expect(status.dbPath).toContain('test-e2e.db');
       expect(status.dbSize).toBeGreaterThan(0);
-      expect(status.schemaVersion).toBe(4);
+      expect(status.schemaVersion).toBe(5);
       expect(status.sessions.total).toBeGreaterThanOrEqual(1);
       expect(status.sessions.active).toBeGreaterThanOrEqual(1);
       expect(status.observations).toBeGreaterThanOrEqual(1);
@@ -1268,7 +1268,7 @@ describe('MCP Server — Tool execution simulation', () => {
     insertObservation(sid, { tool_name: 'Bash', action: 'status test', cwd: TEST_CWD });
 
     const status = getStatusData(TEST_CWD);
-    expect(status.schemaVersion).toBe(4);
+    expect(status.schemaVersion).toBe(5);
     expect(status.sessions.total).toBeGreaterThanOrEqual(1);
     expect(status.observations).toBeGreaterThanOrEqual(1);
   });
@@ -1370,13 +1370,13 @@ describe('MCP Server — JSON-RPC Protocol (subprocess)', () => {
     expect(ping.result).toEqual({});
   });
 
-  test('tools/list returns all 12 tools', async () => {
+  test('tools/list returns all 13 tools', async () => {
     const responses = await mcpRequest([
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
       { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
     ]);
     const toolsList = responses.find(r => r.id === 2);
-    expect(toolsList.result.tools.length).toBe(12);
+    expect(toolsList.result.tools.length).toBe(13);
 
     const names = toolsList.result.tools.map(t => t.name);
     expect(names).toContain('search');
@@ -1618,10 +1618,10 @@ describe('DB Schema & Migration', () => {
   beforeEach(() => { cleanDb(); });
   afterEach(() => { closeDb(); });
 
-  test('fresh DB starts at schema v4', () => {
+  test('fresh DB starts at schema v5', () => {
     const db = getDb();
     const row = db.prepare('SELECT version FROM schema_version').get();
-    expect(row.version).toBe(4);
+    expect(row.version).toBe(5);
   });
 
   test('execution_snapshots has v2 columns', () => {

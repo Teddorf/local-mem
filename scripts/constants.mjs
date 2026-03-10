@@ -132,6 +132,7 @@ export const RENDER = {
   MAX_PLAN_ITEMS:          10, // plan items shown
   MAX_PENDING_TASKS:       10, // pending tasks shown
   SESSION_ID_DISPLAY_LEN:  8,  // chars of session ID to display
+  MAX_KEY_FILES_DETECT:    10, // max key_files from inferProjectDna
   MAX_KEY_FILES_INDEX:     2,  // key files in session index
   MAX_SUMMARY_FILES:       3,  // files in summary section
   WRITE_PREVIEW_LINES:     2,  // lines to preview in Write distill

@@ -1,44 +1,79 @@
 # SPEC: local-mem — Memoria persistente local para Claude Code
 
-**Version**: 0.8.0 (draft)
-**Fecha**: 2026-03-09
+**Version**: 0.9.0
+**Fecha**: 2026-03-10
 **Status**: Draft
 
 ---
 
 ## Indice
 
+### Fundamentos
 1. [Changelog del SPEC](#changelog-del-spec) — Historial de cambios del diseño por versión
-2. [Componente 1: Base de datos](#componente-1-base-de-datos-scriptsdbmjs) — Schema, migraciones, normalizeCwd, API exportada, FTS5
-3. [Componente 2: Módulo de redacción](#componente-2-modulo-de-redaccion-scriptsredactmjs) — Patrones de secrets, sanitización, tests
-4. [Componente 3: Helper stdin](#componente-3-helper-stdin-scriptsstdinmjs) — Lectura de stdin con timeout y límite
-5. [Componente 4: Hooks](#componente-4-hooks) — Validación stdin, SessionStart, UserPromptSubmit, PostToolUse, SessionEnd
-6. [Componente 5: MCP Server](#componente-5-mcp-server-mcpservermjs) — Lifecycle, protocolo, tools, shutdown, línea buffering
-7. [Componente 6: Instalador](#componente-6-instalador-installmjs) — Merge de hooks, registro MCP, formato settings.json
-8. [Componente 7: Desinstalador](#componente-7-desinstalador-uninstallmjs) — Cleanup limpio, preserva DB
-9. [Componente 8: Health check](#componente-8-health-check-scriptsstatusmjs) — Verificación de estado
-10. [Archivos a crear](#archivos-a-crear-28-total) — Mapa completo del proyecto
-11. [Aislamiento multi-proyecto](#aislamiento-multi-proyecto) — Garantías, reglas, escenarios
-12. [Integración de sistemas](#integracion-de-sistemas) — Flujo end-to-end, inicialización, concurrencia, errores
-13. [Verificación](#verificacion) — Checklist de validación
-14. [Principios de seguridad](#principios-de-seguridad) — 12 principios fundamentales
-15. [Roadmap](#roadmap-futuro-no-incluido-en-v01) — Planes futuros
-16. [Audit QA Post-Implementación](#audit-qa-post-implementacion-v010) — Bugs, falsos positivos, score
-17. [Deuda técnica conocida](#deuda-tecnica-conocida-v01--v06) — Limitaciones actuales
-18. [Plan de implementación v0.6.0](#plan-de-implementacion-v060) — Grafo de dependencias, fases
-19. [Plan de implementación v0.8.0](#plan-de-implementacion-v080) — Inyección semántica, 10 fixes, 3 batches
-20. [Plan de implementación v0.9.0](#plan-de-implementacion-v090--project-dna) — Project DNA, auto-detect, 5 agentes
-21. [Plan de implementación v0.10.0](#plan-de-implementacion-v0100--resumen-con-ia) — Resumen con IA, API Haiku, 4 agentes
-22. [Plan de implementación v0.11.0](#plan-de-implementacion-v0110--budget-aware-rendering) — Budget-aware, BudgetRenderer, 3 agentes
-23. [Datos no aprovechados](#datos-disponibles-no-aprovechados-oportunidad-cross-version) — Quick wins con datos existentes
-24. [Resumen de agentes por versión](#resumen-de-agentes-por-version) — 12 agentes, 9 batches
-25. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
+2. [Contexto](#contexto) — Problema que resuelve local-mem
+3. [Objetivo](#objetivo) — Métricas de éxito y principios de diseño
+4. [Arquitectura](#arquitectura) — Diagrama de componentes y flujo de datos
+
+### Componentes del sistema
+5. [Componente 1: Base de datos](#componente-1-base-de-datos-scriptsdbmjs) — Schema v5, migraciones, normalizeCwd, API exportada, FTS5, Project DNA
+6. [Componente 2: Módulo de redacción](#componente-2-modulo-de-redaccion-scriptsredactmjs) — Patrones de secrets, sanitización, tests
+7. [Componente 3: Helper stdin](#componente-3-helper-stdin-scriptsstdinmjs) — Lectura de stdin con timeout y límite
+8. [Componente 4: Hooks](#componente-4-hooks) — Validación stdin, SessionStart, UserPromptSubmit, PostToolUse, SessionEnd
+9. [Componente 5: MCP Server](#componente-5-mcp-server-mcpservermjs) — Lifecycle, protocolo, 13 tools, shutdown, línea buffering
+10. [Componente 6: Instalador](#componente-6-instalador-installmjs) — Merge de hooks, registro MCP, formato settings.json
+11. [Componente 7: Desinstalador](#componente-7-desinstalador-uninstallmjs) — Cleanup limpio, preserva DB
+12. [Componente 8: Health check](#componente-8-health-check-scriptsstatusmjs) — Verificación de estado
+13. [Componente 9: Constantes](#componente-9-constantes-scriptsconstantsmjs) — 80+ constantes centralizadas en 10 categorías
+
+### Estructura y garantías
+14. [Archivos a crear](#archivos-a-crear-29-total) — Mapa completo del proyecto (29 archivos)
+15. [Archivos a modificar](#archivos-a-modificar) — Cambios en settings.json del usuario
+16. [Aislamiento multi-proyecto](#aislamiento-multi-proyecto) — Garantías, reglas, escenarios
+17. [Integración de sistemas](#integracion-de-sistemas) — Flujo end-to-end, inicialización, concurrencia, errores
+18. [Verificación](#verificacion) — Checklist de validación
+19. [Principios de seguridad](#principios-de-seguridad) — 12 principios fundamentales
+
+### Evolución
+20. [Roadmap](#roadmap-futuro-no-incluido-en-v01) — Planes futuros post-v0.11.0
+21. [Audit QA Post-Implementación](#audit-qa-post-implementacion-v010) — Bugs, falsos positivos, score
+22. [Deuda técnica conocida](#deuda-tecnica-conocida-v01--v06) — Limitaciones actuales
+
+### Planes de implementación
+23. [Plan v0.6.0](#plan-de-implementacion-v060) — Grafo de dependencias, fases
+24. [Plan v0.8.0](#plan-de-implementacion-v080) — Inyección semántica, 10 fixes, 3 batches
+25. [Plan v0.9.0 — Project DNA](#plan-de-implementacion-v090--project-dna) — Auto-detect stack, schema v5, 5 agentes ✅ IMPLEMENTADO
+26. [Plan v0.10.0 — Resumen con IA](#plan-de-implementacion-v0100--resumen-con-ia) — Resumen con IA, API Haiku, 4 agentes
+27. [Plan v0.11.0 — Budget-aware rendering](#plan-de-implementacion-v0110--budget-aware-rendering) — BudgetRenderer, prioridades por sección, 3 agentes
+
+### Apéndices
+28. [Datos no aprovechados](#datos-disponibles-no-aprovechados-oportunidad-cross-version) — Quick wins con datos existentes
+29. [Resumen de agentes por versión](#resumen-de-agentes-por-version) — 12 agentes, 9 batches
+30. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
+31. [Review v0.9.0](#review-v090--project-dna) — Compliance 95%, code quality, test gaps
 
 ---
 
 ## Changelog del SPEC
 
-### [0.8.0] — 2026-03-09 (draft)
+### [0.9.0] — 2026-03-10
+#### Project DNA — Identidad persistente del proyecto
+
+**Problema**: Cada sesión re-descubre el stack tecnológico del proyecto (TypeScript, Bun, SQLite, ESM, etc.). Este re-discovery desperdicia tokens y tiempo.
+
+**Solución**: Auto-detección de stack desde archivos modificados/leídos y bash actions. Almacenamiento persistente en tabla `project_profile` (schema v5). Rendering en context header para level >= 2.
+
+**Cambios**:
+- Schema v5: tabla `project_profile` con `cwd UNIQUE`, `source` (auto|manual), `stack/patterns/key_files/conventions` como JSON
+- `inferProjectDna()` en session-end.mjs: 12 heurísticas de detección (TS, ESM, Python, Rust, Go, React, Vue, Svelte, SQLite, Docker, Bun, Node.js)
+- `getProjectDna/updateProjectDna/setProjectDna` en db.mjs: CRUD con protección manual, union merge para auto
+- MCP tool `project_dna`: GET (consulta) y SET (override manual)
+- DNA rendering en session-start.mjs: `DNA: TypeScript + Bun + ESM | Key: db.mjs, server.mjs`
+- 36 tests nuevos (dna.test.mjs + e2e updates)
+- Eliminación de TODOS los valores hardcoded → `constants.mjs` (80+ constantes, 10 categorías)
+
+**Review**: Compliance 95%. 3 issues críticos identificados (race condition, empty array falsy, hardcoded limit).
+
+### [0.8.0] — 2026-03-09
 #### Inyección Semántica de Contexto — "No perder nada"
 
 **Root cause**: La inyección de contexto actual tiene ~30% de señal útil. Los problemas principales: 1) En compact, se lee el transcript de OTRA sesión (bug crítico), 2) Solo se inyectan 10 de N observations y 5 de N prompts, perdiendo ~85% del contexto de la sesión actual, 3) Los auto-snapshots contaminan campos "Pendiente" y "Decisiones" con datos crudos (build logs, prompts sin curar), 4) El resumen viene del último mensaje del asistente (puede ser "Listo" o "Perfecto"), 5) Las secciones "Últimas N acciones" y "Top por relevancia" se solapan, desperdiciando ~100 tokens, 6) Los campos `plan` y `pending_tasks` del snapshot existen en la DB pero nunca se inyectan.
@@ -3060,3 +3095,54 @@ Estos son **quick wins** que no requieren features nuevas — solo wiring en ren
 3. Post en Claude Code community (Discord/GitHub discussions)
 4. Si hay traccion, contactar Anthropic para integracion nativa
 5. Si hay demanda enterprise, evaluar modelo open core
+
+---
+
+## Review v0.9.0 — Project DNA
+
+**Fecha**: 2026-03-10
+**Reviewers**: 3 agentes especializados (Compliance, Testing, Code Quality)
+
+### Compliance vs SPEC: 95% ✅
+
+| Componente | Estado | Detalle |
+|-----------|--------|---------|
+| Schema `project_profile` (migration v5) | ✅ | Exacto al plan |
+| `getProjectDna(cwd)` | ✅ | Retorna objeto completo o null |
+| `updateProjectDna(cwd, detected)` | ✅ | Union merge, protección manual |
+| `setProjectDna(cwd, data)` | ✅ | Upsert con source='manual' |
+| `inferProjectDna()` | ✅ | 12 heurísticas (11 SPEC + extras) |
+| DNA rendering en session-start | ✅ | level >= 2, formato correcto |
+| MCP tool `project_dna` | ✅ | GET/SET funcional |
+| Tests (36 tests) | ✅ | Unitarios completos |
+
+#### Gaps menores
+- `patterns` array nunca se llena automáticamente (retorna `[]`)
+- Invalidación stale (>30 días) no implementada
+- Archivo test nombrado `dna.test.mjs` vs plan `v090.test.mjs`
+- Detección extra no planificada: Vue, Svelte (mejora, no gap)
+
+### Test Coverage: ⚠️ Parcial
+
+| Función | Tests | Coverage |
+|---------|-------|----------|
+| `inferProjectDna` | 19 | ✅ Completa |
+| `getProjectDna` | 1 | ⚠️ Solo null case |
+| `updateProjectDna` | 6 | ⚠️ Sin integración |
+| `setProjectDna` | 5 | ✅ Completa |
+| Schema v5 | 6 (e2e) | ✅ Completa |
+| MCP tool `project_dna` | 0 | ❌ Faltante |
+| Integración session-end→DNA | 0 | ❌ Faltante |
+
+### Code Quality: 3 issues críticos
+
+1. **Race condition en `updateProjectDna`** (db.mjs) — Read-check-write sin `BEGIN IMMEDIATE`
+2. **Empty array falsy en MCP tool** (server.mjs) — `if (stack || ...)` falla con `[]`
+3. **Hardcoded `10`** en session-end.mjs:45 — key_files limit no usa constants
+
+### Acción requerida antes de commit
+
+- [ ] Fix race condition: envolver updateProjectDna en transacción
+- [ ] Fix empty array check: usar `!== undefined` en vez de truthy
+- [ ] Mover hardcoded 10 a constants.mjs
+- [ ] Agregar tests MCP tool project_dna en e2e.test.mjs (mínimo 5 tests)
