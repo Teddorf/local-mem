@@ -1,6 +1,6 @@
 # SPEC: local-mem — Memoria persistente local para Claude Code
 
-**Version**: 0.10.0
+**Version**: 0.11.0
 **Fecha**: 2026-03-10
 **Status**: Draft
 
@@ -43,7 +43,7 @@
 24. [Plan v0.8.0](#plan-de-implementacion-v080) — Inyección semántica, 10 fixes, 3 batches
 25. [Plan v0.9.0 — Project DNA](#plan-de-implementacion-v090--project-dna) — Auto-detect stack, schema v5, 5 agentes ✅ IMPLEMENTADO
 26. [Plan v0.10.0 — Resumen con IA](#plan-de-implementacion-v0100--resumen-con-ia) — Resumen con IA, API Haiku, 4 agentes ✅ IMPLEMENTADO
-27. [Plan v0.11.0 — Budget-aware rendering](#plan-de-implementacion-v0110--budget-aware-rendering) — BudgetRenderer, prioridades por sección, 3 agentes
+27. [Plan v0.11.0 — Budget-aware rendering](#plan-de-implementacion-v0110--budget-aware-rendering) — BudgetRenderer, prioridades por sección, 3 agentes ✅ IMPLEMENTADO
 
 ### Apéndices
 28. [Datos no aprovechados](#datos-disponibles-no-aprovechados-oportunidad-cross-version) — Quick wins con datos existentes
@@ -51,10 +51,24 @@
 30. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
 31. [Review v0.9.0](#review-v090--project-dna) — Compliance 95%, code quality, test gaps
 32. [Review v0.10.0](#review-v0100--resumen-con-ia) — Compliance 95%, AI integration, 16 tests
+33. [Review v0.11.0](#review-v0110--budget-aware-rendering) — Compliance 98%, budget allocation, 21 tests
 
 ---
 
 ## Changelog del SPEC
+
+### [0.11.0] — 2026-03-10
+#### Budget-aware rendering — Presupuesto inteligente por sección
+
+**Problema**: Límites hardcoded (200 obs, 50 prompts, 30 líneas) no se adaptan al volumen de actividad. Poca actividad desperdicia espacio, mucha actividad corta arbitrariamente.
+
+**Solución**: Refactor de `buildHistoricalContext` en 8 funciones modulares `renderXxx` + `allocateBudget()` que asigna tokens por prioridad hasta agotar un budget configurable por nivel.
+
+**Cambios**:
+- `session-start.mjs`: 8 render functions (Dna, Resumen, Estado, Razonamiento, Pedidos, Actividad, Cross, Indice) + `allocateBudget()` exportado
+- `shared.mjs`: `estimateTokens()` + `CHARS_PER_TOKEN` constant
+- `constants.mjs`: categoría `BUDGET` — level budgets (150/800/1200), 8 section priorities con min/max tokens
+- 21 tests nuevos (budget.test.mjs), 288 total passing
 
 ### [0.10.0] — 2026-03-10
 #### Resumen con IA — Opt-in semantic summaries
@@ -3206,3 +3220,39 @@ Estos son **quick wins** que no requieren features nuevas — solo wiring en ren
 - API key no expuesta en logs
 - DB cleanup correcto en todos los paths
 - Todos los hardcoded values centralizados en constants.mjs
+
+---
+
+## Review v0.11.0 — Budget-aware rendering
+
+**Fecha**: 2026-03-10
+**Reviewers**: 3 agentes especializados (Compliance, Testing, Code Quality)
+
+### Compliance vs SPEC: 98% ✅
+
+| Componente | Estado | Detalle |
+|-----------|--------|---------|
+| BudgetRenderer / allocateBudget | ✅ | Exportado, asigna por prioridad |
+| estimateTokens (≤15% error) | ✅ | ~4 chars/token, tested |
+| 8 secciones modulares | ✅ | renderXxx pattern consistente |
+| LEVEL_BUDGETS (150/800/1200) | ✅ | Exacto al plan |
+| SECTION_PRIORITY (8 secciones) | ✅ | Orden y min/max correctos |
+| Truncamiento en newline | ✅ | lastIndexOf('\n') |
+| Output ≤ budget | ✅ | Math.min guard agregado |
+
+### Issues corregidos post-review
+- Safety guard: `Math.min(allocated, remaining)` en truncación
+- Hardcoded `4` → `CHARS_PER_TOKEN` constant
+- `TOLERANCE` unused → reemplazado por `CHARS_PER_TOKEN`
+
+### Test Coverage: 21 tests ⚠️
+- `estimateTokens`: 6 tests ✅
+- `allocateBudget`: 11 tests ✅
+- `BUDGET constants`: 4 tests ✅
+- `renderXxx` individuales: 0 tests ❌ (internas)
+- `buildHistoricalContext` e2e: 0 tests ❌
+
+### Code Quality: 7.5/10
+- Refactor preserva funcionalidad original
+- parseJsonSafe usado consistentemente
+- Graceful null handling en todas las secciones

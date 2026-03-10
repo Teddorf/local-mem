@@ -174,6 +174,22 @@ export const PATTERNS = {
   OTHER_MEMORY_PLUGINS: ['claude-mem', 'memory-plugin', 'persistent-memory', 'cline-memory'],
 };
 
+// ─── Budget-aware rendering ─────────────────────────────────────────────────
+export const BUDGET = {
+  LEVEL_BUDGETS: { 1: 150, 2: 800, 3: 1200 },
+  SECTION_PRIORITY: [
+    { id: 'estado',       minTokens: 40,  maxTokens: 150 },
+    { id: 'dna',          minTokens: 30,  maxTokens: 80  },
+    { id: 'resumen',      minTokens: 50,  maxTokens: 200 },
+    { id: 'pedidos',      minTokens: 30,  maxTokens: 100 },
+    { id: 'razonamiento', minTokens: 50,  maxTokens: 300 },
+    { id: 'actividad',    minTokens: 50,  maxTokens: 400 },
+    { id: 'cross',        minTokens: 40,  maxTokens: 200 },
+    { id: 'indice',       minTokens: 30,  maxTokens: 100 },
+  ],
+  CHARS_PER_TOKEN: 4,  // estimation: ~4 chars per token
+};
+
 // ─── AI Summary ─────────────────────────────────────────────────────────────
 export const AI = {
   API_ENDPOINT:        'https://api.anthropic.com/v1/messages',
