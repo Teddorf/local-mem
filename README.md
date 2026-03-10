@@ -11,7 +11,7 @@
 
 Every tool use, prompt, and session is recorded locally in SQLite. At the start of each new session, Claude automatically receives a curated summary of recent activity — what you were working on, what's pending, and what decisions are open. 12 MCP tools let you search, query, and manage your memory from within Claude Code.
 
-Works with any Claude model (Opus, Sonnet, Haiku). No AI API calls — everything runs locally with Bun + SQLite.
+Works with any Claude model (Opus, Sonnet, Haiku). Everything runs locally with Bun + SQLite. Optional opt-in AI summaries via Claude API (requires API key).
 
 ---
 

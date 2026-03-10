@@ -3,7 +3,8 @@ import { basename, isAbsolute } from 'path';
 import { readStdin } from './stdin.mjs';
 import { getDb, completeSession, getSessionStats, normalizeCwd, insertTurnLog, updateProjectDna } from './db.mjs';
 import { redact } from './redact.mjs';
-import { SIZES, TRUNCATE, RENDER } from './constants.mjs';
+import { SIZES, TRUNCATE, RENDER, AI } from './constants.mjs';
+import { generateAiSummary } from './ai.mjs';
 
 const LAST_200KB = SIZES.TRANSCRIPT_MAX_END;
 
@@ -220,6 +221,43 @@ async function extractThinkingFromTranscript(transcriptPath, sessionId, cwd) {
   }
 }
 
+function collectAiContext(sessionId, cwd, filesModified) {
+  const db = getDb();
+  try {
+    const nCwd = normalizeCwd(cwd);
+
+    const promptRows = db.prepare(`
+      SELECT prompt_text FROM user_prompts
+      WHERE session_id = ? ORDER BY created_at DESC LIMIT ?
+    `).all(sessionId, AI.CONTEXT_PROMPTS);
+    const prompts = promptRows.map(r => r.prompt_text).reverse();
+
+    // Current task from snapshot
+    const snapshot = db.prepare(`
+      SELECT current_task FROM execution_snapshots
+      WHERE session_id = ? AND cwd = ?
+      ORDER BY CASE WHEN snapshot_type = 'manual' THEN 0 ELSE 1 END, created_at DESC
+      LIMIT 1
+    `).get(sessionId, nCwd);
+
+    const obsRows = db.prepare(`
+      SELECT action FROM observations
+      WHERE session_id = ? AND action IS NOT NULL
+      ORDER BY created_at DESC LIMIT ?
+    `).all(sessionId, AI.CONTEXT_OBSERVATIONS);
+    const topObservations = obsRows.map(r => r.action).reverse();
+
+    return {
+      files_modified: (filesModified || []).map(f => basename(f)),
+      prompts,
+      current_task: snapshot?.current_task || null,
+      top_observations: topObservations,
+    };
+  } finally {
+    db.close();
+  }
+}
+
 function getToolsAndFiles(sessionId) {
   const db = getDb();
   try {
@@ -285,12 +323,32 @@ async function main() {
     }
 
     const stats = getSessionStats(session_id);
+
+    const obsCount = stats ? stats.observation_count : 0;
+    const promptCount = stats ? stats.prompt_count : 0;
+
+    // Skip completing sessions with zero activity (ghost sessions)
+    if (obsCount === 0 && promptCount === 0) {
+      process.stdout.write('Success\n');
+      process.exit(0);
+    }
+
     const { tools_used, files_read, files_modified, bash_actions } = getToolsAndFiles(session_id);
 
-    // Intentar resumen estructurado primero (datos DB) — reutiliza tools/files ya extraídos
-    summaryText = buildStructuredSummary(session_id, cwd, { tools_used, files_modified });
+    // Collect prompts + snapshot for AI summary context
+    const aiContext = collectAiContext(session_id, cwd, files_modified);
 
-    // Fallback: extraer del transcript
+    // 1) Intentar resumen con IA (opt-in, necesita API key)
+    try {
+      summaryText = await generateAiSummary(aiContext);
+    } catch { /* best-effort — fall through to structured */ }
+
+    // 2) Fallback: resumen estructurado (datos DB)
+    if (!summaryText) {
+      summaryText = buildStructuredSummary(session_id, cwd, { tools_used, files_modified });
+    }
+
+    // 3) Fallback: extraer del transcript
     if (!summaryText && useTranscript) {
       summaryText = extractTranscriptSummary(transcript_path);
     }
@@ -307,15 +365,6 @@ async function main() {
 
     const nCwd = normalizeCwd(cwd || '');
     const project = nCwd ? basename(nCwd) : '';
-
-    const obsCount = stats ? stats.observation_count : 0;
-    const promptCount = stats ? stats.prompt_count : 0;
-
-    // Skip completing sessions with zero activity (ghost sessions)
-    if (obsCount === 0 && promptCount === 0) {
-      process.stdout.write('Success\n');
-      process.exit(0);
-    }
 
     completeSession(session_id, {
       cwd: nCwd,

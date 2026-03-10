@@ -174,6 +174,19 @@ export const PATTERNS = {
   OTHER_MEMORY_PLUGINS: ['claude-mem', 'memory-plugin', 'persistent-memory', 'cline-memory'],
 };
 
+// ─── AI Summary ─────────────────────────────────────────────────────────────
+export const AI = {
+  API_ENDPOINT:        'https://api.anthropic.com/v1/messages',
+  API_VERSION:         '2023-06-01',
+  DEFAULT_MODEL:       'claude-haiku-4-5-20251001',
+  DEFAULT_TIMEOUT_MS:  5_000,      // 5s — abort fetch after this
+  MAX_TOKENS:          200,        // max response tokens
+  RESPONSE_MIN_LENGTH: 10,         // min chars to accept
+  RESPONSE_MAX_LENGTH: 500,        // max chars to accept
+  CONTEXT_PROMPTS:     5,          // last N user prompts for context
+  CONTEXT_OBSERVATIONS: 5,         // last N observations for context
+};
+
 // ─── URLs ────────────────────────────────────────────────────────────────────
 export const URLS = {
   GITHUB_PACKAGE_JSON: 'https://raw.githubusercontent.com/Teddorf/local-mem/main/package.json',
