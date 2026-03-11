@@ -200,13 +200,13 @@ function captureTechnicalState(cwd) {
       const stdout = execFileSync('bun', ['test'],
         { cwd, timeout, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
       const combined = stdout.replace(/\r/g, '');
-      state.test_summary = combined.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, TRUNCATE.DISTILL_TEST_SUMMARY);
+      state.test_summary = redact(combined.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, TRUNCATE.DISTILL_TEST_SUMMARY));
     }
   } catch (e) {
     // bun test exits non-zero on failures — still capture summary
     const out = ((e.stdout || '') + (e.stderr || '')).replace(/\r/g, '');
     if (out) {
-      state.test_summary = out.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, TRUNCATE.DISTILL_TEST_SUMMARY);
+      state.test_summary = redact(out.split('\n').filter(Boolean).slice(-3).join('\n').slice(0, TRUNCATE.DISTILL_TEST_SUMMARY));
     }
   }
 

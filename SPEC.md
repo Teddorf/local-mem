@@ -1,6 +1,6 @@
 # SPEC: local-mem — Memoria persistente local para Claude Code
 
-**Version**: 0.11.0
+**Version**: 0.12.0
 **Fecha**: 2026-03-10
 **Status**: Draft
 
@@ -44,18 +44,35 @@
 25. [Plan v0.9.0 — Project DNA](#plan-de-implementacion-v090--project-dna) — Auto-detect stack, schema v5, 5 agentes ✅ IMPLEMENTADO
 26. [Plan v0.10.0 — Resumen con IA](#plan-de-implementacion-v0100--resumen-con-ia) — Resumen con IA, API Haiku, 4 agentes ✅ IMPLEMENTADO
 27. [Plan v0.11.0 — Budget-aware rendering](#plan-de-implementacion-v0110--budget-aware-rendering) — BudgetRenderer, prioridades por sección, 3 agentes ✅ IMPLEMENTADO
+28. [Plan v0.12.0 — DNA Tooling CLI](#plan-de-implementacion-v0120--dna-tooling-cli) — Detección de herramientas CLI, schema v6, 4 agentes
 
 ### Apéndices
-28. [Datos no aprovechados](#datos-disponibles-no-aprovechados-oportunidad-cross-version) — Quick wins con datos existentes
-29. [Resumen de agentes por versión](#resumen-de-agentes-por-version) — 12 agentes, 9 batches
-30. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
-31. [Review v0.9.0](#review-v090--project-dna) — Compliance 95%, code quality, test gaps
-32. [Review v0.10.0](#review-v0100--resumen-con-ia) — Compliance 95%, AI integration, 16 tests
-33. [Review v0.11.0](#review-v0110--budget-aware-rendering) — Compliance 98%, budget allocation, 21 tests
+29. [Datos no aprovechados](#datos-disponibles-no-aprovechados-oportunidad-cross-version) — Quick wins con datos existentes
+30. [Resumen de agentes por versión](#resumen-de-agentes-por-version) — 12+ agentes, 9+ batches
+31. [Estrategia de publicación](#estrategia-de-publicacion) — Open source, licencia
+32. [Review v0.9.0](#review-v090--project-dna) — Compliance 95%, code quality, test gaps
+33. [Review v0.10.0](#review-v0100--resumen-con-ia) — Compliance 95%, AI integration, 16 tests
+34. [Review v0.11.0](#review-v0110--budget-aware-rendering) — Compliance 98%, budget allocation, 21 tests
 
 ---
 
 ## Changelog del SPEC
+
+### [0.12.0] — 2026-03-10
+#### DNA Tooling CLI — Detección de herramientas CLI en Project DNA
+
+**Problema**: `inferProjectDna()` solo detecta stack por extensiones de archivo y 4 regex de bash actions (bun/npm/yarn/pnpm). No detecta herramientas CLI del proyecto (docker, terraform, kubectl, aws, cargo, go, make, python) ni infiere desde manifiestos/lockfiles.
+
+**Solución**: Ampliar `inferProjectDna()` con 2 capas de detección pasiva (sin ejecutar procesos externos): (1) detección por lockfiles/manifiestos en `filesRead`/`filesModified`, (2) regex expandido de bash actions. Nueva columna `tools TEXT` en `project_profile` separada de `stack` para semántica clara. Migración schema v5→v6.
+
+**Cambios**:
+- `session-end.mjs`: ampliar `inferProjectDna()` con detección de lockfiles (bun.lock, package-lock.json, yarn.lock, Cargo.lock, go.sum, Pipfile.lock, pyproject.toml, Makefile, Dockerfile, docker-compose.yml, *.tf) y regex bash expandido (docker, terraform, kubectl, aws, gcloud, cargo, go, python, make, helm, ansible)
+- `db.mjs`: migración v5→v6 (`ALTER TABLE project_profile ADD COLUMN tools TEXT`), actualizar `getProjectDna()`, `updateProjectDna()`, `setProjectDna()` para manejar `tools`
+- `mcp/server.mjs`: exponer `tools` en MCP tool `project_dna` (input/output)
+- `session-start.mjs`: actualizar `renderDna()` para mostrar tools detectados
+- `constants.mjs`: agregar `DNA.LOCKFILE_MAP` y `DNA.BASH_TOOL_PATTERNS`
+- `observation.mjs`: fix — aplicar `redact()` a `test_summary` en `captureTechnicalState()`
+- Tests nuevos para detección de lockfiles, bash tools, migración v6, rendering
 
 ### [0.11.0] — 2026-03-10
 #### Budget-aware rendering — Presupuesto inteligente por sección
@@ -2436,7 +2453,8 @@ local-mem sigue estos principios (documentados en SECURITY.md):
 - **Busqueda semantica**: embeddings locales via modelo ONNX lightweight
 - **Dashboard web**: UI local para explorar la memoria visualmente
 - **Multi-device sync**: export/import encriptado para mover memoria entre maquinas
-- **DNA: detección de tooling CLI**: Detectar MCP servers, skills y hooks habilitados en el CLI del usuario e incluirlos en el Project DNA (ej: Canva, Notion, Vercel, n8n, Hugging Face). Permite que el contexto inyectado refleje las capacidades disponibles, no solo el stack del código
+- ~~**DNA: detección de tooling CLI**~~: ✅ Movido a Plan v0.12.0
+- **Remote DB sync**: Conectar la base local a una DB remota para backup/sync multi-device. Protocolo API REST propio (zero-deps), sync manual via MCP tools (sync_push, sync_pull, sync_status). Requiere diseño de seguridad previo (credenciales, redacción, exclusión de turn_log/user_prompts)
 
 ---
 
@@ -3066,6 +3084,187 @@ El refactor de `buildHistoricalContext` (~250 líneas) es el cambio más grande.
 - Secciones de baja prioridad se omiten si no hay budget
 - `estimateTokens()` tiene ≤15% error vs tokenizer real
 - Tests pasan para: budget exacto, overflow, underflow, empty sections
+
+---
+
+## Plan de implementación v0.12.0 — DNA Tooling CLI
+
+### Contexto
+
+`inferProjectDna()` en `session-end.mjs:11-55` detecta el stack tecnológico del proyecto pero no identifica herramientas CLI (docker, terraform, kubectl, aws, cargo, go, make, python). La detección actual se basa solo en extensiones de archivo y 4 regex de bash actions. Se amplía con detección pasiva por lockfiles/manifiestos y regex expandido, sin ejecutar procesos externos (respeta el modelo pasivo y los timeouts de hooks).
+
+### Grafo de dependencias
+
+```
+                    ┌─────────────────────────┐
+                    │  B1: Schema + Constants  │
+                    │  (db.mjs, constants.mjs) │
+                    └──────────┬──────────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+              ▼                ▼                ▼
+┌─────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│  B2: Detection   │ │  B3: MCP + Render │ │  B2b: Bug fix    │
+│  (session-end)   │ │  (server, s-start)│ │  (observation)   │
+└────────┬────────┘ └────────┬─────────┘ └────────┬─────────┘
+         │                   │                     │
+         └───────────────────┼─────────────────────┘
+                             │
+                             ▼
+                    ┌─────────────────────────┐
+                    │  B4: Tests + Review      │
+                    │  (tests/dna-tooling.*)   │
+                    └─────────────────────────┘
+```
+
+### Batches y asignación de agentes
+
+#### Batch 1: Schema v6 + Constants (prerequisito)
+**Skill:** `/spec_coder`
+
+| Tarea | Archivo | Cambio |
+|-------|---------|--------|
+| T1.1 | `scripts/constants.mjs` | Agregar categoría `DNA` con `LOCKFILE_MAP` (lockfile→tool) y `BASH_TOOL_PATTERNS` (regex→tool) |
+| T1.2 | `scripts/db.mjs` | Migración v5→v6: `ALTER TABLE project_profile ADD COLUMN tools TEXT` |
+| T1.3 | `scripts/db.mjs` | Actualizar `getProjectDna()`: incluir `tools` en SELECT y return |
+| T1.4 | `scripts/db.mjs` | Actualizar `updateProjectDna()`: merge por union de sets para `tools` |
+| T1.5 | `scripts/db.mjs` | Actualizar `setProjectDna()`: aceptar `tools` en override manual |
+
+#### Batch 2: Detection engine (core feature)
+**Skill:** `/spec_coder`
+
+| Tarea | Archivo | Cambio |
+|-------|---------|--------|
+| T2.1 | `scripts/session-end.mjs` | Capa 1: detectar lockfiles/manifiestos por basename en `allFiles` (filesRead + filesModified). Mapear via `DNA.LOCKFILE_MAP` |
+| T2.2 | `scripts/session-end.mjs` | Capa 2: expandir regex de bash actions con `DNA.BASH_TOOL_PATTERNS` (docker, terraform, kubectl, aws, gcloud, cargo, go, python, make, helm, ansible) |
+| T2.3 | `scripts/session-end.mjs` | Retornar `tools` como array separado de `stack` en el resultado de `inferProjectDna()` |
+| T2.4 | `scripts/session-end.mjs` | Pasar `tools` a `updateProjectDna()` en el flujo de session-end |
+
+#### Batch 2b: Bug fix (paralelo a B2)
+**Skill:** `/spec_coder`
+
+| Tarea | Archivo | Cambio |
+|-------|---------|--------|
+| T2b.1 | `scripts/observation.mjs` | Aplicar `redact()` a `test_summary` en `captureTechnicalState()` antes de almacenar — hallazgo P8 Seguridad |
+
+#### Batch 3: MCP + Rendering (depende de B1)
+**Skill:** `/spec_coder`
+
+| Tarea | Archivo | Cambio |
+|-------|---------|--------|
+| T3.1 | `mcp/server.mjs` | Actualizar schema del tool `project_dna`: agregar `tools` al inputSchema (set) y al output (get) |
+| T3.2 | `mcp/server.mjs` | Actualizar handler de `project_dna` para pasar/retornar `tools` |
+| T3.3 | `scripts/session-start.mjs` | Actualizar `renderDna()` para mostrar tools si existen: `DNA: TypeScript + Bun | Tools: docker, terraform | Key: db.mjs` |
+
+#### Batch 4: Tests + Review
+**Skill:** `/spec_tester` → `/review` → `/debug` (si hay fallos)
+
+| Tarea | Archivo | Cambio |
+|-------|---------|--------|
+| T4.1 | `tests/dna.test.mjs` | Tests de `inferProjectDna()` con fixtures de lockfiles (bun.lock, Cargo.lock, go.sum, Makefile, Dockerfile) |
+| T4.2 | `tests/dna.test.mjs` | Tests de bash actions expandidos (terraform plan, kubectl apply, docker build, aws s3 ls, cargo build) |
+| T4.3 | `tests/dna.test.mjs` | Tests de false-positive mitigation (lockfile en subdirectorio, tool global no usado) |
+| T4.4 | `tests/dna.test.mjs` | Test de migración v5→v6 (columna tools nullable, retrocompatibilidad) |
+| T4.5 | `tests/dna.test.mjs` | Test de `renderDna()` con y sin tools |
+| T4.6 | `tests/dna.test.mjs` | Test de `updateProjectDna()` merge de tools (union de sets, no duplicados) |
+| T4.7 | `tests/dna.test.mjs` | Test de `setProjectDna()` con tools override manual |
+| T4.8 | — | `/review` (spec-gatekeeper): code review completo pre-merge |
+| T4.9 | — | `/debug` si algún test falla en B4 |
+
+### Plan de ejecución: fases, paralelismo y workers
+
+```
+FASE 1 (paralelo, 2 workers)          FASE 2 (paralelo, 2 workers)
+┌──────────────────────────┐           ┌──────────────────────────┐
+│ W1: /spec_coder          │           │ W3: /spec_coder          │
+│ B1 — Schema + Constants  │──────────▶│ B2 — Detection engine    │
+│ constants.mjs, db.mjs    │     │     │ session-end.mjs          │
+└──────────────────────────┘     │     └──────────────────────────┘
+┌──────────────────────────┐     │     ┌──────────────────────────┐
+│ W2: /spec_coder          │     │     │ W4: /spec_coder          │
+│ B2b — Fix redact         │     └────▶│ B3 — MCP + Render        │
+│ observation.mjs          │           │ server.mjs, s-start.mjs  │
+└──────────────────────────┘           └──────────┬───────────────┘
+                                                  │
+                                    FASE 3 (paralelo, 2 workers)
+                                    ┌──────────────────────────┐
+                                    │ W5: /spec_tester         │
+                                    │ B4 — Tests completos     │
+                                    │ tests/dna.test.mjs       │
+                                    └──────────────────────────┘
+                                    ┌──────────────────────────┐
+                                    │ W6: /review              │
+                                    │ B4 — Code review         │
+                                    │ Todos los cambios        │
+                                    └──────────┬───────────────┘
+                                               │
+                                    FASE 4 (condicional, 1 worker)
+                                    ┌──────────────────────────┐
+                                    │ W7: /debug               │
+                                    │ Solo si hay failures     │
+                                    └──────────────────────────┘
+```
+
+| Fase | Workers | Tareas | Skill | Dependencia | Archivos |
+|------|---------|--------|-------|-------------|----------|
+| F1 | W1 | B1: T1.1–T1.5 (schema + constants) | `/spec_coder` | Ninguna | `constants.mjs`, `db.mjs` |
+| F1 | W2 | B2b: T2b.1 (fix redact test_summary) | `/spec_coder` | Ninguna | `observation.mjs` |
+| F2 | W3 | B2: T2.1–T2.4 (detection engine) | `/spec_coder` | F1 (B1) | `session-end.mjs` |
+| F2 | W4 | B3: T3.1–T3.3 (MCP + render) | `/spec_coder` | F1 (B1) | `server.mjs`, `session-start.mjs` |
+| F3 | W5 | B4: T4.1–T4.7 (tests) | `/spec_tester` | F2 (B2+B3) | `tests/dna.test.mjs` |
+| F3 | W6 | B4: T4.8 (code review) | `/review` | F2 (B2+B3) | Todos los cambios |
+| F4 | W7 | B4: T4.9 (debug si hay failures) | `/debug` | F3 | Archivos fallidos |
+
+**Totales**: 3 fases obligatorias + 1 condicional | Máx 2 workers concurrentes | 6-7 workers total
+
+### Detecciones a implementar
+
+#### Lockfiles/Manifiestos → Tools (`DNA.LOCKFILE_MAP`)
+
+| Archivo | Tool detectado |
+|---------|---------------|
+| `bun.lock`, `bun.lockb` | bun |
+| `package-lock.json` | npm |
+| `yarn.lock` | yarn |
+| `pnpm-lock.yaml` | pnpm |
+| `Cargo.lock`, `Cargo.toml` | cargo |
+| `go.mod`, `go.sum` | go |
+| `requirements.txt`, `Pipfile.lock`, `pyproject.toml` | pip |
+| `Makefile` | make |
+| `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `docker-compose.yaml` | docker |
+| `*.tf`, `.terraform/` | terraform |
+| `Gemfile.lock` | bundler |
+
+#### Bash Actions → Tools (`DNA.BASH_TOOL_PATTERNS`)
+
+| Regex | Tool detectado |
+|-------|---------------|
+| `\bdocker\s+(build\|run\|compose\|push\|pull)` | docker |
+| `\bterraform\s+(plan\|apply\|init\|destroy)` | terraform |
+| `\bkubectl\s` | kubectl |
+| `\bhelm\s` | helm |
+| `\baws\s` | aws-cli |
+| `\bgcloud\s` | gcloud |
+| `\baz\s+(login\|account\|group)` | azure-cli |
+| `\bcargo\s+(build\|run\|test\|add)` | cargo |
+| `\bgo\s+(run\|build\|test\|mod)` | go |
+| `\b(python3?\|pip3?)\s` | python |
+| `\bmake\s` | make |
+| `\bansible(-playbook)?\s` | ansible |
+
+### Criterio de aceptación
+
+- `inferProjectDna()` detecta tools por lockfiles sin ejecutar procesos externos
+- `inferProjectDna()` detecta tools por bash actions con regex expandido
+- `tools` se almacena separado de `stack` en `project_profile`
+- `updateProjectDna()` hace merge de tools por union de sets (no duplicados)
+- `setProjectDna()` acepta override manual de `tools` (respeta `source='manual'`)
+- MCP tool `project_dna` expone `tools` en get y set
+- `renderDna()` muestra tools cuando existen
+- `test_summary` pasa por `redact()` antes de almacenarse (fix seguridad)
+- Migración v5→v6 es retrocompatible (columna nullable)
+- Tests cubren: lockfile detection, bash detection, false positives, migration, rendering, merge, manual override
 
 ---
 

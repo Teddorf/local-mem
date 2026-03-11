@@ -362,6 +362,20 @@ export function getDb(dbPath) {
     }
   }
 
+  if (currentVersion < 6) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      // v0.12 DNA Tooling CLI: separate tools column
+      db.exec(`ALTER TABLE project_profile ADD COLUMN tools TEXT`);
+      db.exec(`UPDATE schema_version SET version=6, applied_at=unixepoch() WHERE rowid=1`);
+      db.exec('COMMIT');
+      process.stderr.write('[local-mem] Migration v5→v6 applied\n');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw new Error(`Migration v5→v6 failed: ${e.message}`);
+    }
+  }
+
   return db;
 }
 
@@ -901,7 +915,7 @@ export function getProjectDna(cwd) {
   const nCwd = normalizeCwd(cwd);
   try {
     const row = db.prepare(`
-      SELECT stack, patterns, key_files, conventions, updated_at, source
+      SELECT stack, patterns, key_files, tools, conventions, updated_at, source
       FROM project_profile WHERE cwd = ?
     `).get(nCwd);
     if (!row) return null;
@@ -909,6 +923,7 @@ export function getProjectDna(cwd) {
       stack: row.stack ? JSON.parse(row.stack) : [],
       patterns: row.patterns ? JSON.parse(row.patterns) : [],
       key_files: row.key_files ? JSON.parse(row.key_files) : [],
+      tools: row.tools ? JSON.parse(row.tools) : [],
       conventions: row.conventions || '',
       updated_at: row.updated_at,
       source: row.source,
@@ -928,7 +943,7 @@ export function updateProjectDna(cwd, detected) {
     try {
       // Never overwrite manual entries
       const existing = db.prepare(`
-        SELECT stack, patterns, key_files, source FROM project_profile WHERE cwd = ?
+        SELECT stack, patterns, key_files, tools, source FROM project_profile WHERE cwd = ?
       `).get(nCwd);
 
       if (existing && existing.source === 'manual') {
@@ -940,31 +955,36 @@ export function updateProjectDna(cwd, detected) {
       let stack = new Set(detected.stack || []);
       let patterns = new Set(detected.patterns || []);
       let key_files = new Set(detected.key_files || []);
+      let tools = new Set(detected.tools || []);
 
       if (existing) {
         try {
           const oldStack = JSON.parse(existing.stack || '[]');
           const oldPatterns = JSON.parse(existing.patterns || '[]');
           const oldKeyFiles = JSON.parse(existing.key_files || '[]');
+          const oldTools = JSON.parse(existing.tools || '[]');
           for (const s of oldStack) stack.add(s);
           for (const p of oldPatterns) patterns.add(p);
           for (const f of oldKeyFiles) key_files.add(f);
+          for (const t of oldTools) tools.add(t);
         } catch { /* corrupted JSON — start fresh */ }
       }
 
       db.prepare(`
-        INSERT INTO project_profile (cwd, stack, patterns, key_files, conventions, updated_at, source)
-        VALUES (?, ?, ?, ?, ?, unixepoch(), 'auto')
+        INSERT INTO project_profile (cwd, stack, patterns, key_files, tools, conventions, updated_at, source)
+        VALUES (?, ?, ?, ?, ?, ?, unixepoch(), 'auto')
         ON CONFLICT(cwd) DO UPDATE SET
           stack = excluded.stack,
           patterns = excluded.patterns,
           key_files = excluded.key_files,
+          tools = excluded.tools,
           updated_at = excluded.updated_at
       `).run(
         nCwd,
         JSON.stringify([...stack]),
         JSON.stringify([...patterns]),
         JSON.stringify([...key_files]),
+        JSON.stringify([...tools]),
         detected.conventions || null
       );
       db.exec('COMMIT');
@@ -982,12 +1002,13 @@ export function setProjectDna(cwd, data) {
   const nCwd = normalizeCwd(cwd);
   try {
     db.prepare(`
-      INSERT INTO project_profile (cwd, stack, patterns, key_files, conventions, updated_at, source)
-      VALUES (?, ?, ?, ?, ?, unixepoch(), 'manual')
+      INSERT INTO project_profile (cwd, stack, patterns, key_files, tools, conventions, updated_at, source)
+      VALUES (?, ?, ?, ?, ?, ?, unixepoch(), 'manual')
       ON CONFLICT(cwd) DO UPDATE SET
         stack = excluded.stack,
         patterns = excluded.patterns,
         key_files = excluded.key_files,
+        tools = excluded.tools,
         conventions = excluded.conventions,
         updated_at = excluded.updated_at,
         source = 'manual'
@@ -996,6 +1017,7 @@ export function setProjectDna(cwd, data) {
       JSON.stringify(data.stack || []),
       JSON.stringify(data.patterns || []),
       JSON.stringify(data.key_files || []),
+      JSON.stringify(data.tools || []),
       data.conventions || null
     );
   } finally {

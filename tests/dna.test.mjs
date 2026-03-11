@@ -303,3 +303,220 @@ describe('Project DNA DB functions', () => {
     expect(dna.stack).toEqual([]);
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DNA Tooling CLI — v0.12.0
+// ═════════════════════════════════════════════════════════════════════════════
+describe('DNA Tooling CLI — v0.12.0', () => {
+
+  // ─── T4.1 — Lockfile detection ──────────────────────────────────────────────
+  describe('T4.1 — Lockfile detection', () => {
+    test('bun.lock → tools includes bun', () => {
+      const result = inferProjectDna({}, [], ['bun.lock'], []);
+      expect(result.tools).toContain('bun');
+    });
+
+    test('Cargo.lock → tools includes cargo', () => {
+      const result = inferProjectDna({}, [], ['Cargo.lock'], []);
+      expect(result.tools).toContain('cargo');
+    });
+
+    test('go.mod → tools includes go', () => {
+      const result = inferProjectDna({}, [], ['go.mod'], []);
+      expect(result.tools).toContain('go');
+    });
+
+    test('Makefile → tools includes make', () => {
+      const result = inferProjectDna({}, [], ['Makefile'], []);
+      expect(result.tools).toContain('make');
+    });
+
+    test('Dockerfile → tools includes docker', () => {
+      const result = inferProjectDna({}, [], ['Dockerfile'], []);
+      expect(result.tools).toContain('docker');
+    });
+
+    test('multiple lockfiles → tools has all without duplicates', () => {
+      const result = inferProjectDna(
+        {},
+        ['bun.lock', 'Dockerfile', 'go.mod', 'Makefile'],
+        ['Cargo.lock', 'docker-compose.yml'],
+        []
+      );
+      expect(result.tools).toContain('bun');
+      expect(result.tools).toContain('docker');
+      expect(result.tools).toContain('go');
+      expect(result.tools).toContain('make');
+      expect(result.tools).toContain('cargo');
+      // docker should not be duplicated (Dockerfile + docker-compose.yml)
+      expect(result.tools.filter(t => t === 'docker').length).toBe(1);
+    });
+  });
+
+  // ─── T4.2 — Bash action detection ──────────────────────────────────────────
+  describe('T4.2 — Bash action detection', () => {
+    test('terraform plan → tools includes terraform', () => {
+      const result = inferProjectDna({}, [], [], ['terraform plan']);
+      expect(result.tools).toContain('terraform');
+    });
+
+    test('kubectl apply -f deploy.yaml → tools includes kubectl', () => {
+      const result = inferProjectDna({}, [], [], ['kubectl apply -f deploy.yaml']);
+      expect(result.tools).toContain('kubectl');
+    });
+
+    test('docker build . → tools includes docker', () => {
+      const result = inferProjectDna({}, [], [], ['docker build .']);
+      expect(result.tools).toContain('docker');
+    });
+
+    test('aws s3 ls → tools includes aws-cli', () => {
+      const result = inferProjectDna({}, [], [], ['aws s3 ls']);
+      expect(result.tools).toContain('aws-cli');
+    });
+
+    test('cargo build → tools includes cargo', () => {
+      const result = inferProjectDna({}, [], [], ['cargo build']);
+      expect(result.tools).toContain('cargo');
+    });
+  });
+
+  // ─── T4.3 — False positive mitigation ──────────────────────────────────────
+  describe('T4.3 — False positive mitigation', () => {
+    test('empty filesRead/bashActions → tools is empty array', () => {
+      const result = inferProjectDna({}, [], [], []);
+      expect(result.tools).toEqual([]);
+    });
+
+    test('filesRead without known lockfiles → tools empty', () => {
+      const result = inferProjectDna({}, [], ['src/app.ts', 'README.md', 'lib/utils.js'], []);
+      expect(result.tools).toEqual([]);
+    });
+
+    test('bashActions with docker as substring in another word → NOT detected', () => {
+      // 'dockerize-app' does not match \\bdocker\\s+(build|run|compose|push|pull)
+      const result = inferProjectDna({}, [], [], ['dockerize-app start']);
+      expect(result.tools).not.toContain('docker');
+    });
+  });
+
+  // ─── T4.4 — Migration v6 ──────────────────────────────────────────────────
+  describe('T4.4 — Migration v6', () => {
+    test('DB has schema version 6', () => {
+      const db = getDb();
+      try {
+        const row = db.prepare('SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1').get();
+        expect(row.version).toBe(6);
+      } finally {
+        db.close();
+      }
+    });
+
+    test('project_profile has tools column', () => {
+      const db = getDb();
+      try {
+        const cols = db.prepare("PRAGMA table_info(project_profile)").all();
+        const colNames = cols.map(c => c.name);
+        expect(colNames).toContain('tools');
+      } finally {
+        db.close();
+      }
+    });
+  });
+
+  // ─── T4.5 — renderDna() con tools ─────────────────────────────────────────
+  describe('T4.5 — renderDna() with tools', () => {
+    beforeEach(() => cleanDb());
+
+    test('with tools → output includes Tools:', () => {
+      updateProjectDna(TEST_CWD, {
+        stack: ['TypeScript'],
+        tools: ['docker', 'terraform'],
+        key_files: ['app.ts'],
+      });
+      const dna = getProjectDna(TEST_CWD);
+      // Replicate renderDna logic since it's not exported
+      const parts = [];
+      if (dna.stack.length > 0) parts.push(dna.stack.join(' + '));
+      if (dna.tools && dna.tools.length > 0) parts.push(`Tools: ${dna.tools.join(', ')}`);
+      if (dna.patterns.length > 0) parts.push(dna.patterns.join(', '));
+      if (dna.key_files.length > 0) parts.push(`Key: ${dna.key_files.slice(0, 5).join(', ')}`);
+      const output = `DNA: ${parts.join(' | ')}`;
+      expect(output).toContain('Tools:');
+      expect(output).toContain('docker');
+      expect(output).toContain('terraform');
+    });
+
+    test('without tools → output does NOT include Tools:', () => {
+      updateProjectDna(TEST_CWD, {
+        stack: ['TypeScript'],
+        tools: [],
+        key_files: ['app.ts'],
+      });
+      const dna = getProjectDna(TEST_CWD);
+      const parts = [];
+      if (dna.stack.length > 0) parts.push(dna.stack.join(' + '));
+      if (dna.tools && dna.tools.length > 0) parts.push(`Tools: ${dna.tools.join(', ')}`);
+      if (dna.patterns.length > 0) parts.push(dna.patterns.join(', '));
+      if (dna.key_files.length > 0) parts.push(`Key: ${dna.key_files.slice(0, 5).join(', ')}`);
+      const output = `DNA: ${parts.join(' | ')}`;
+      expect(output).not.toContain('Tools:');
+    });
+  });
+
+  // ─── T4.6 — updateProjectDna() merge tools ────────────────────────────────
+  describe('T4.6 — updateProjectDna() merge tools', () => {
+    beforeEach(() => cleanDb());
+
+    test('merges tools from successive calls', () => {
+      updateProjectDna(TEST_CWD, {
+        stack: ['TypeScript'],
+        tools: ['docker'],
+      });
+      updateProjectDna(TEST_CWD, {
+        stack: ['TypeScript'],
+        tools: ['terraform'],
+      });
+      const dna = getProjectDna(TEST_CWD);
+      expect(dna.tools).toContain('docker');
+      expect(dna.tools).toContain('terraform');
+    });
+
+    test('does not duplicate existing tools', () => {
+      updateProjectDna(TEST_CWD, {
+        stack: ['TypeScript'],
+        tools: ['docker'],
+      });
+      updateProjectDna(TEST_CWD, {
+        stack: ['TypeScript'],
+        tools: ['docker', 'terraform'],
+      });
+      const dna = getProjectDna(TEST_CWD);
+      expect(dna.tools.filter(t => t === 'docker').length).toBe(1);
+      expect(dna.tools).toContain('terraform');
+    });
+  });
+
+  // ─── T4.7 — setProjectDna() manual override con tools ─────────────────────
+  describe('T4.7 — setProjectDna() manual override with tools', () => {
+    beforeEach(() => cleanDb());
+
+    test('setProjectDna with tools → getProjectDna returns tools', () => {
+      setProjectDna(TEST_CWD, {
+        stack: ['Python'],
+        tools: ['custom-tool'],
+      });
+      const dna = getProjectDna(TEST_CWD);
+      expect(dna.tools).toEqual(['custom-tool']);
+    });
+
+    test('source is manual', () => {
+      setProjectDna(TEST_CWD, {
+        stack: ['Python'],
+        tools: ['custom-tool'],
+      });
+      const dna = getProjectDna(TEST_CWD);
+      expect(dna.source).toBe('manual');
+    });
+  });
+});

@@ -253,6 +253,7 @@ function renderDna(cwd) {
   if (!dna || (dna.stack.length === 0 && dna.patterns.length === 0)) return null;
   const parts = [];
   if (dna.stack.length > 0) parts.push(dna.stack.join(' + '));
+  if (dna.tools && dna.tools.length > 0) parts.push(`Tools: ${dna.tools.join(', ')}`);
   if (dna.patterns.length > 0) parts.push(dna.patterns.join(', '));
   if (dna.key_files.length > 0) parts.push(`Key: ${dna.key_files.slice(0, 5).join(', ')}`);
   return `DNA: ${parts.join(' | ')}`;

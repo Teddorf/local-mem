@@ -3,13 +3,14 @@ import { basename, isAbsolute } from 'path';
 import { readStdin } from './stdin.mjs';
 import { getDb, completeSession, getSessionStats, normalizeCwd, insertTurnLog, updateProjectDna } from './db.mjs';
 import { redact } from './redact.mjs';
-import { SIZES, TRUNCATE, RENDER, AI } from './constants.mjs';
+import { SIZES, TRUNCATE, RENDER, AI, DNA } from './constants.mjs';
 import { generateAiSummary } from './ai.mjs';
 
 const LAST_200KB = SIZES.TRANSCRIPT_MAX_END;
 
 export function inferProjectDna(toolsUsed, filesModified, filesRead, bashActions) {
   const stackSet = new Set();
+  const toolsSet = new Set();
   const patterns = [];
   const keyFilesSet = new Set();
 
@@ -30,6 +31,11 @@ export function inferProjectDna(toolsUsed, filesModified, filesRead, bashActions
     if (lower.endsWith('.svelte')) stackSet.add('Svelte');
     if (lower.endsWith('.sql') || lower.includes('sqlite')) stackSet.add('SQLite');
     if (lower.includes('docker') || base === 'Dockerfile') stackSet.add('Docker');
+
+    // Capa 1: Detección de tools por lockfiles/manifiestos
+    if (DNA.LOCKFILE_MAP[base]) {
+      toolsSet.add(DNA.LOCKFILE_MAP[base]);
+    }
   }
 
   // Detect from Bash tool actions
@@ -37,6 +43,13 @@ export function inferProjectDna(toolsUsed, filesModified, filesRead, bashActions
     const joined = bashActions.join(' ').toLowerCase();
     if (/\bbun\b/.test(joined)) stackSet.add('Bun');
     if (/\bnpm\b/.test(joined) || /\byarn\b/.test(joined) || /\bpnpm\b/.test(joined)) stackSet.add('Node.js');
+
+    // Capa 2: Detección de tools por bash action patterns
+    for (const pattern of DNA.BASH_TOOL_PATTERNS) {
+      if (new RegExp(pattern.regex).test(joined)) {
+        toolsSet.add(pattern.tool);
+      }
+    }
   }
 
   // Collect key_files from modified files (basenames, deduplicated, max 10)
@@ -49,6 +62,7 @@ export function inferProjectDna(toolsUsed, filesModified, filesRead, bashActions
 
   return {
     stack: [...stackSet],
+    tools: [...toolsSet],
     patterns,
     key_files: [...keyFilesSet]
   };
@@ -381,7 +395,7 @@ async function main() {
     if (obsCount > 0) {
       try {
         const detected = inferProjectDna(tools_used, files_modified, files_read, bash_actions);
-        if (detected.stack.length > 0 || detected.key_files.length > 0) {
+        if (detected.stack.length > 0 || detected.key_files.length > 0 || detected.tools.length > 0) {
           updateProjectDna(cwd, detected);
         }
       } catch { /* best-effort */ }

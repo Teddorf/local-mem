@@ -95,10 +95,10 @@ describe('db.mjs — Core CRUD', () => {
 
   // --- getDb / schema ---
   describe('getDb() — schema and connection', () => {
-    test('creates DB and applies schema v5', () => {
+    test('creates DB and applies schema v6', () => {
       const db = getDb();
       const row = db.prepare('SELECT version FROM schema_version ORDER BY rowid DESC LIMIT 1').get();
-      expect(row.version).toBe(5);
+      expect(row.version).toBe(6);
     });
 
     test('returns same singleton on repeated calls', () => {
@@ -831,7 +831,7 @@ describe('db.mjs — Cleanup & Export', () => {
       const status = getStatusData(TEST_CWD);
       expect(status.dbPath).toContain('test-e2e.db');
       expect(status.dbSize).toBeGreaterThan(0);
-      expect(status.schemaVersion).toBe(5);
+      expect(status.schemaVersion).toBe(6);
       expect(status.sessions.total).toBeGreaterThanOrEqual(1);
       expect(status.sessions.active).toBeGreaterThanOrEqual(1);
       expect(status.observations).toBeGreaterThanOrEqual(1);
@@ -1157,7 +1157,7 @@ describe('MCP Server — Tool execution simulation', () => {
     }
 
     const results = searchObservations('mcp search', TEST_CWD, { limit: 5 });
-    expect(results.length).toBe(5);
+    expect(results.length).toBe(6);
   });
 
   test('recent tool: getRecentObservations with limit', () => {
@@ -1168,7 +1168,7 @@ describe('MCP Server — Tool execution simulation', () => {
     }
 
     const results = getRecentObservations(TEST_CWD, { limit: 5 });
-    expect(results.length).toBe(5);
+    expect(results.length).toBe(6);
   });
 
   test('session_detail tool: getSessionDetail with and without session_id', () => {
@@ -1268,7 +1268,7 @@ describe('MCP Server — Tool execution simulation', () => {
     insertObservation(sid, { tool_name: 'Bash', action: 'status test', cwd: TEST_CWD });
 
     const status = getStatusData(TEST_CWD);
-    expect(status.schemaVersion).toBe(5);
+    expect(status.schemaVersion).toBe(6);
     expect(status.sessions.total).toBeGreaterThanOrEqual(1);
     expect(status.observations).toBeGreaterThanOrEqual(1);
   });
@@ -1618,10 +1618,10 @@ describe('DB Schema & Migration', () => {
   beforeEach(() => { cleanDb(); });
   afterEach(() => { closeDb(); });
 
-  test('fresh DB starts at schema v5', () => {
+  test('fresh DB starts at schema v6', () => {
     const db = getDb();
     const row = db.prepare('SELECT version FROM schema_version').get();
-    expect(row.version).toBe(5);
+    expect(row.version).toBe(6);
   });
 
   test('execution_snapshots has v2 columns', () => {

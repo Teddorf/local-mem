@@ -203,6 +203,39 @@ export const AI = {
   CONTEXT_OBSERVATIONS: 5,         // last N observations for context
 };
 
+// ─── DNA Detection ──────────────────────────────────────────────────────────
+export const DNA = {
+  // Lockfile/manifest basename → tool name
+  LOCKFILE_MAP: {
+    'bun.lock': 'bun', 'bun.lockb': 'bun',
+    'package-lock.json': 'npm',
+    'yarn.lock': 'yarn',
+    'pnpm-lock.yaml': 'pnpm',
+    'Cargo.lock': 'cargo', 'Cargo.toml': 'cargo',
+    'go.mod': 'go', 'go.sum': 'go',
+    'requirements.txt': 'pip', 'Pipfile.lock': 'pip', 'pyproject.toml': 'pip',
+    'Makefile': 'make',
+    'Dockerfile': 'docker', '.dockerignore': 'docker',
+    'docker-compose.yml': 'docker', 'docker-compose.yaml': 'docker',
+    'Gemfile.lock': 'bundler',
+  },
+  // Bash action regex patterns → tool name (strings for serializability)
+  BASH_TOOL_PATTERNS: [
+    { regex: '\\bdocker\\s+(build|run|compose|push|pull)', tool: 'docker' },
+    { regex: '\\bterraform\\s+(plan|apply|init|destroy)', tool: 'terraform' },
+    { regex: '\\bkubectl\\s', tool: 'kubectl' },
+    { regex: '\\bhelm\\s', tool: 'helm' },
+    { regex: '\\baws\\s', tool: 'aws-cli' },
+    { regex: '\\bgcloud\\s', tool: 'gcloud' },
+    { regex: '\\baz\\s+(login|account|group)', tool: 'azure-cli' },
+    { regex: '\\bcargo\\s+(build|run|test|add)', tool: 'cargo' },
+    { regex: '\\bgo\\s+(run|build|test|mod)', tool: 'go' },
+    { regex: '\\b(python3?|pip3?)\\s', tool: 'python' },
+    { regex: '\\bmake\\s', tool: 'make' },
+    { regex: '\\bansible(-playbook)?\\s', tool: 'ansible' },
+  ],
+};
+
 // ─── URLs ────────────────────────────────────────────────────────────────────
 export const URLS = {
   GITHUB_PACKAGE_JSON: 'https://raw.githubusercontent.com/Teddorf/local-mem/main/package.json',
